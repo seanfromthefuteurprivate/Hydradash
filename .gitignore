@@ -7,3 +7,4 @@ data/
 *.json
 !package.json
 .DS_Store
+.claude/settings.local.json
