@@ -43,25 +43,33 @@ trading_engine = None  # Initialized if Alpaca keys present
 ws_clients: list[WebSocket] = []
 
 
+async def broadcast_to_clients(data: str):
+    """Safely broadcast to all WebSocket clients from async context."""
+    disconnected = []
+    for ws in ws_clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            disconnected.append(ws)
+    for ws in disconnected:
+        ws_clients.remove(ws)
+
+
 # ── Background Workers ──
-def signal_scan_loop():
+def signal_scan_loop(loop: asyncio.AbstractEventLoop):
     """Continuously scan all data sources."""
     while True:
         try:
             new_signals = signal_orch.scan_all()
             if new_signals:
                 log.info(f"Signal scan: {len(new_signals)} new signals")
-                # Push to websocket clients
+                # Push to websocket clients via the main event loop
                 data = json.dumps({
                     "type": "signals_update",
                     "signals": [s.to_dict() for s in new_signals],
                     "summary": signal_orch.get_summary()
                 }, default=str)
-                for ws in ws_clients[:]:
-                    try:
-                        asyncio.run(ws.send_text(data))
-                    except Exception:
-                        ws_clients.remove(ws)
+                asyncio.run_coroutine_threadsafe(broadcast_to_clients(data), loop)
         except Exception as e:
             log.error(f"Signal scan error: {e}")
         time.sleep(60)  # Scan every 60 seconds
@@ -106,9 +114,12 @@ def telegram_poll_loop():
 # ── App Lifecycle ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Get the running event loop to pass to background threads
+    loop = asyncio.get_running_loop()
+
     # Start background threads
     threads = [
-        threading.Thread(target=signal_scan_loop, daemon=True, name="signal-scanner"),
+        threading.Thread(target=signal_scan_loop, args=(loop,), daemon=True, name="signal-scanner"),
         threading.Thread(target=trading_loop, daemon=True, name="trading-engine"),
         threading.Thread(target=telegram_poll_loop, daemon=True, name="telegram-poller"),
     ]

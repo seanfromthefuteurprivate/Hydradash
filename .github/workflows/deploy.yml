@@ -1,84 +1,74 @@
-name: HYDRA Deploy
+name: HYDRA CI/CD
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository_owner }}/hydra
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install & test backend
+      - name: Install Python deps
+        run: pip install -r backend/requirements.txt
+      - name: Validate imports
         run: |
           cd backend
-          pip install -r requirements.txt
-          python -c "from hydra_signal_detection import SignalOrchestrator; print('Signal engine OK')"
-          python -c "from hydra_engine import HydraOrchestrator; print('Trading engine OK')"
-          python -c "from hydra_telegram import SignalParser; p = SignalParser(); print('Telegram parser OK')"
-
+          python -c "from server import app; print('Server OK')"
+          python -c "from hydra_signal_detection import SignalOrchestrator; print('Signals OK')"
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
       - name: Build frontend
-        run: |
-          cd frontend
-          npm install
-          npm run build
+        run: cd frontend && npm install && npm run build
 
   build-and-push:
-    needs: test
     runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push backend
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: ./backend
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:latest
-
-      - name: Build & push frontend
-        uses: docker/build-push-action@v5
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:latest
+      - uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:latest
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:latest
 
   deploy:
-    needs: build-and-push
     runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
     steps:
-      - name: Deploy to VM
-        uses: appleboy/ssh-action@v1
+      - uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
             cd /opt/hydra
-            docker compose pull
-            docker compose up -d --remove-orphans
+            git pull origin main
+            docker compose up -d --build
             docker system prune -f
-            echo "HYDRA deployed at $(date)"

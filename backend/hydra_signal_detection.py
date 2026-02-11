@@ -622,6 +622,9 @@ class FREDConnector(BaseConnector):
         "DFF": {"name": "Fed Funds Rate", "impact": "rates"},
         "T10Y2Y": {"name": "10Y-2Y Spread", "threshold_low": 0, "impact": "recession"},
         "BAMLH0A0HYM2": {"name": "HY Credit Spread", "impact": "credit"},
+        # GROUP 3 additions: ISM Manufacturing and ADP Employment
+        "NAPM": {"name": "ISM Manufacturing PMI", "threshold_low": 50, "impact": "manufacturing"},
+        "ADPMNUSNERSA": {"name": "ADP Employment Change", "threshold_low": 100, "impact": "labor"},
     }
 
     def fetch_signals(self) -> list[DetectedSignal]:
@@ -734,6 +737,112 @@ class FREDConnector(BaseConnector):
                     ttl_hours=168,
                     reliability_score=0.70
                 ))
+
+            # SIGNAL: ISM Manufacturing PMI (Source 13)
+            if series_id == "NAPM":
+                if latest_val < 50:  # Contraction territory
+                    signals.append(DetectedSignal(
+                        id=self._make_id("ism", obs[0]["date"]),
+                        name=f"ISM Manufacturing: {latest_val:.1f} — Contraction",
+                        source_name="FRED / ISM",
+                        source_api="api.stlouisfed.org/NAPM",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.HIGH if latest_val < 48 else SignalPriority.MEDIUM,
+                        direction=-0.6,
+                        strength=min(1.0, (50 - latest_val) / 10),
+                        description=(
+                            f"ISM Manufacturing PMI at {latest_val:.1f} — below 50 = contraction. "
+                            f"Changed {change:+.1f} from prior. Manufacturing weakness signals "
+                            f"economic slowdown. ISM Prices Paid leads CPI by 2-3 months."
+                        ),
+                        affected_assets=["SPY", "XLI", "CAT", "DE", "IWM"],
+                        trade_implications=[
+                            "Sell industrials (XLI, CAT, DE)",
+                            "Small caps underperform in manufacturing downturns",
+                            "Buy TLT — economic weakness = rate cuts"
+                        ],
+                        opportunities=[
+                            "Manufacturing bottoms are buying opportunities",
+                            "ISM < 45 historically = market bottoms"
+                        ],
+                        raw_data={"value": latest_val, "change": change, "date": obs[0]["date"]},
+                        ttl_hours=720,  # Monthly data
+                        reliability_score=self.reliability
+                    ))
+                elif latest_val > 55:  # Strong expansion
+                    signals.append(DetectedSignal(
+                        id=self._make_id("ism_strong", obs[0]["date"]),
+                        name=f"ISM Manufacturing: {latest_val:.1f} — Strong Expansion",
+                        source_name="FRED / ISM",
+                        source_api="api.stlouisfed.org/NAPM",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.MEDIUM,
+                        direction=0.5,
+                        strength=min(0.8, (latest_val - 50) / 10),
+                        description=(
+                            f"ISM Manufacturing at {latest_val:.1f}. Strong expansion. "
+                            f"Bullish for industrials and cyclicals."
+                        ),
+                        affected_assets=["XLI", "CAT", "DE"],
+                        trade_implications=["Buy cyclicals", "Risk-on positioning"],
+                        opportunities=["Manufacturing strength = economic growth"],
+                        raw_data={"value": latest_val, "date": obs[0]["date"]},
+                        ttl_hours=720,
+                        reliability_score=self.reliability
+                    ))
+
+            # SIGNAL: ADP Employment (Source 14)
+            if series_id == "ADPMNUSNERSA":
+                if latest_val < 100:  # Weak job growth (in thousands)
+                    signals.append(DetectedSignal(
+                        id=self._make_id("adp", obs[0]["date"]),
+                        name=f"ADP Employment: {latest_val:.0f}K — Weak",
+                        source_name="FRED / ADP",
+                        source_api="api.stlouisfed.org/ADPMNUSNERSA",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.HIGH if latest_val < 50 else SignalPriority.MEDIUM,
+                        direction=-0.5,
+                        strength=min(1.0, (150 - latest_val) / 150),
+                        description=(
+                            f"ADP private payrolls at {latest_val:.0f}K (changed {change:+.0f}K). "
+                            f"Weak private sector hiring. ADP showed only 22K in Jan 2026. "
+                            f"This leads NFP and signals labor market cooling."
+                        ),
+                        affected_assets=["SPY", "TLT", "XLY", "IWM"],
+                        trade_implications=[
+                            "Buy TLT — rate cut expectations rise on weak labor",
+                            "Sell consumer discretionary (XLY)",
+                            "Position for weak NFP print"
+                        ],
+                        opportunities=[
+                            "Weak labor = Fed pivot = risk asset rally eventually",
+                            "Pre-position before NFP based on ADP weakness"
+                        ],
+                        raw_data={"value": latest_val, "change": change, "date": obs[0]["date"]},
+                        ttl_hours=168,
+                        reliability_score=0.70
+                    ))
+                elif latest_val > 200:  # Strong job growth
+                    signals.append(DetectedSignal(
+                        id=self._make_id("adp_strong", obs[0]["date"]),
+                        name=f"ADP Employment: {latest_val:.0f}K — Strong",
+                        source_name="FRED / ADP",
+                        source_api="api.stlouisfed.org/ADPMNUSNERSA",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.MEDIUM,
+                        direction=0.3,
+                        strength=min(0.7, (latest_val - 150) / 150),
+                        description=(
+                            f"ADP at {latest_val:.0f}K — strong private hiring. "
+                            f"Healthy labor market but may delay Fed cuts."
+                        ),
+                        affected_assets=["SPY", "TLT"],
+                        trade_implications=["Risk-on but watch for hawkish Fed"],
+                        opportunities=["Strong labor = consumer spending intact"],
+                        raw_data={"value": latest_val, "date": obs[0]["date"]},
+                        ttl_hours=168,
+                        reliability_score=0.70
+                    ))
 
         return signals
 
@@ -1175,6 +1284,446 @@ class CBOEVIXMonitor(BaseConnector):
 
 
 # ───────────────────────────────────────────────────────────
+#  CATEGORY 5B: ADDITIONAL VOLATILITY MONITORS
+# ───────────────────────────────────────────────────────────
+
+class CBOESKEWMonitor(BaseConnector):
+    """Source 30: CBOE SKEW Index — FREE (Yahoo Finance)
+
+    High SKEW = market fears a tail risk event (crash).
+    SKEW > 140 historically precedes major corrections.
+    """
+    name = "CBOE SKEW Index"
+    cost = "FREE"
+    category = SignalCategory.OPTIONS
+    poll_interval_minutes = 60
+    reliability = 0.70
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/^SKEW",
+            params={"interval": "1d", "range": "5d"}
+        )
+
+        if data and "chart" in data:
+            try:
+                result = data["chart"]["result"][0]
+                closes = result["indicators"]["quote"][0]["close"]
+                skew_current = closes[-1] if closes else None
+                skew_prev = closes[-2] if len(closes) > 1 else None
+
+                if skew_current:
+                    if skew_current > 140:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("skew", int(skew_current), datetime.now().date()),
+                            name=f"SKEW Elevated: {skew_current:.1f} — Tail Risk Warning",
+                            source_name="CBOE SKEW Index",
+                            source_api="cboe.com/skew (via Yahoo Finance)",
+                            category=SignalCategory.OPTIONS,
+                            priority=SignalPriority.HIGH if skew_current > 150 else SignalPriority.MEDIUM,
+                            direction=-0.6,
+                            strength=min(1.0, (skew_current - 120) / 40),
+                            description=(
+                                f"SKEW at {skew_current:.1f} — well above normal range (100-130). "
+                                f"Options traders pricing in tail risk. SKEW > 140 historically "
+                                f"precedes major corrections within 2-4 weeks. Buy OTM puts as insurance."
+                            ),
+                            affected_assets=["SPY", "QQQ", "IWM", "VIX"],
+                            trade_implications=[
+                                "Buy SPY/QQQ puts 5-10% OTM, 3-4 weeks expiry",
+                                "Consider VIX call spreads",
+                                "Reduce long exposure, increase cash position"
+                            ],
+                            opportunities=[
+                                "High SKEW = smart money hedging = follow their lead",
+                                "Tail risk insurance is cheap relative to potential payout"
+                            ],
+                            raw_data={"skew": skew_current, "prev_skew": skew_prev},
+                            ttl_hours=12.0,
+                            reliability_score=self.reliability
+                        ))
+                    elif skew_current < 110:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("skew_low", int(skew_current), datetime.now().date()),
+                            name=f"SKEW Low: {skew_current:.1f} — Complacency Signal",
+                            source_name="CBOE SKEW Index",
+                            source_api="cboe.com/skew (via Yahoo Finance)",
+                            category=SignalCategory.OPTIONS,
+                            priority=SignalPriority.LOW,
+                            direction=0.3,
+                            strength=0.4,
+                            description=(
+                                f"SKEW at {skew_current:.1f} — below normal. Markets complacent "
+                                f"about tail risk. This can persist but watch for sudden spikes."
+                            ),
+                            affected_assets=["SPY", "VIX"],
+                            trade_implications=["Tail risk insurance is cheap — good time to hedge"],
+                            opportunities=["Buy protection when nobody wants it"],
+                            raw_data={"skew": skew_current},
+                            ttl_hours=24.0,
+                            reliability_score=0.50
+                        ))
+            except (KeyError, IndexError, TypeError):
+                pass
+        return signals
+
+
+class DXYDollarMonitor(BaseConnector):
+    """Source 35: DXY Dollar Index — FREE (Yahoo Finance)
+
+    Dollar strength kills everything: commodities, EM, crypto, gold.
+    DXY > 105 = risk-off. DXY breakout = sell everything else.
+    """
+    name = "DXY Dollar Index"
+    cost = "FREE"
+    category = SignalCategory.FX
+    poll_interval_minutes = 60
+    reliability = 0.75
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB",
+            params={"interval": "1d", "range": "10d"}
+        )
+
+        if data and "chart" in data:
+            try:
+                result = data["chart"]["result"][0]
+                closes = result["indicators"]["quote"][0]["close"]
+                dxy_current = closes[-1] if closes else None
+                dxy_5d_ago = closes[-5] if len(closes) >= 5 else None
+
+                if dxy_current:
+                    change_5d = ((dxy_current - dxy_5d_ago) / dxy_5d_ago * 100) if dxy_5d_ago else 0
+
+                    if dxy_current > 105:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("dxy_high", int(dxy_current), datetime.now().date()),
+                            name=f"DXY Strong: {dxy_current:.2f} — Risk-Off Pressure",
+                            source_name="DXY Dollar Index",
+                            source_api="Yahoo Finance DX-Y.NYB",
+                            category=SignalCategory.FX,
+                            priority=SignalPriority.HIGH if dxy_current > 108 else SignalPriority.MEDIUM,
+                            direction=-0.5,
+                            strength=min(1.0, (dxy_current - 100) / 10),
+                            description=(
+                                f"DXY at {dxy_current:.2f} ({change_5d:+.1f}% 5d). Strong dollar crushes: "
+                                f"commodities, EM equities, crypto, gold. Dollar strength = global "
+                                f"risk-off signal. Watch for further strength above 110."
+                            ),
+                            affected_assets=["GLD", "SLV", "EEM", "BTC/USD", "GDX", "XLE"],
+                            trade_implications=[
+                                "Sell gold/silver rallies — dollar headwind",
+                                "Avoid EM equities (EEM)",
+                                "Crypto faces pressure from dollar strength",
+                                "Consider UUP (dollar bull ETF) longs"
+                            ],
+                            opportunities=[
+                                "Dollar strength eventually reverses — set alerts for DXY < 102",
+                                "Strong dollar = cheap foreign assets eventually"
+                            ],
+                            raw_data={"dxy": dxy_current, "change_5d": change_5d},
+                            ttl_hours=12.0,
+                            reliability_score=self.reliability
+                        ))
+                    elif dxy_current < 100 and change_5d < -1:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("dxy_weak", int(dxy_current), datetime.now().date()),
+                            name=f"DXY Weakening: {dxy_current:.2f} — Risk-On Signal",
+                            source_name="DXY Dollar Index",
+                            source_api="Yahoo Finance DX-Y.NYB",
+                            category=SignalCategory.FX,
+                            priority=SignalPriority.MEDIUM,
+                            direction=0.5,
+                            strength=min(0.8, abs(change_5d) / 3),
+                            description=(
+                                f"DXY at {dxy_current:.2f} ({change_5d:+.1f}% 5d). Weakening dollar "
+                                f"is bullish for commodities, gold, EM, and crypto."
+                            ),
+                            affected_assets=["GLD", "SLV", "EEM", "BTC/USD"],
+                            trade_implications=["Buy gold/commodity exposure", "Add EM equities"],
+                            opportunities=["Weak dollar cycle historically lasts 6-18 months"],
+                            raw_data={"dxy": dxy_current, "change_5d": change_5d},
+                            ttl_hours=24.0,
+                            reliability_score=self.reliability
+                        ))
+            except (KeyError, IndexError, TypeError):
+                pass
+        return signals
+
+
+class CopperFuturesMonitor(BaseConnector):
+    """Source 33: Copper Futures (HG) — FREE (Yahoo Finance)
+
+    Copper leads equities by 24 hours. Dr. Copper sees the economy first.
+    Copper breakdown = buy SPY puts immediately.
+    """
+    name = "Copper Futures"
+    cost = "FREE"
+    category = SignalCategory.MACRO
+    poll_interval_minutes = 60
+    reliability = 0.72
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/HG=F",
+            params={"interval": "1d", "range": "10d"}
+        )
+
+        if data and "chart" in data:
+            try:
+                result = data["chart"]["result"][0]
+                closes = result["indicators"]["quote"][0]["close"]
+                hg_current = closes[-1] if closes else None
+                hg_prev = closes[-2] if len(closes) > 1 else None
+                hg_5d_ago = closes[-5] if len(closes) >= 5 else None
+
+                if hg_current and hg_prev and hg_5d_ago:
+                    change_1d = ((hg_current - hg_prev) / hg_prev * 100)
+                    change_5d = ((hg_current - hg_5d_ago) / hg_5d_ago * 100)
+
+                    if change_1d < -2:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("copper_drop", datetime.now().date()),
+                            name=f"Copper Breakdown: {change_1d:.1f}% — Equities Warning",
+                            source_name="Copper Futures (HG)",
+                            source_api="Yahoo Finance HG=F",
+                            category=SignalCategory.MACRO,
+                            priority=SignalPriority.HIGH,
+                            direction=-0.7,
+                            strength=min(1.0, abs(change_1d) / 4),
+                            description=(
+                                f"Copper dropped {change_1d:.1f}% today ({change_5d:+.1f}% 5d). "
+                                f"Dr. Copper leads equities by 24 hours. This signals economic "
+                                f"slowdown fears. SPY typically follows within 1-2 sessions."
+                            ),
+                            affected_assets=["SPY", "QQQ", "XLI", "FCX", "SCCO"],
+                            trade_implications=[
+                                "Buy SPY puts — copper leads equities by 24hr",
+                                "Sell industrials (XLI)",
+                                "Copper miners (FCX, SCCO) will underperform"
+                            ],
+                            opportunities=[
+                                "Copper breakdown = economic warning = defensive positioning",
+                                "Wait for copper stabilization before buying cyclicals"
+                            ],
+                            raw_data={"price": hg_current, "change_1d": change_1d, "change_5d": change_5d},
+                            ttl_hours=24.0,
+                            reliability_score=self.reliability
+                        ))
+                    elif change_1d > 2:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("copper_rally", datetime.now().date()),
+                            name=f"Copper Rally: +{change_1d:.1f}% — Economic Optimism",
+                            source_name="Copper Futures (HG)",
+                            source_api="Yahoo Finance HG=F",
+                            category=SignalCategory.MACRO,
+                            priority=SignalPriority.MEDIUM,
+                            direction=0.6,
+                            strength=min(0.8, change_1d / 4),
+                            description=(
+                                f"Copper up {change_1d:.1f}% today. Bullish for cyclicals "
+                                f"and equities. Economic demand signal."
+                            ),
+                            affected_assets=["SPY", "XLI", "FCX", "SCCO"],
+                            trade_implications=["Buy cyclicals (XLI)", "Risk-on positioning"],
+                            opportunities=["Copper rally = economic confidence = buy dips"],
+                            raw_data={"price": hg_current, "change_1d": change_1d, "change_5d": change_5d},
+                            ttl_hours=24.0,
+                            reliability_score=self.reliability
+                        ))
+            except (KeyError, IndexError, TypeError):
+                pass
+        return signals
+
+
+class SolarETFMonitor(BaseConnector):
+    """Source 36: Solar ETF (TAN) as Silver Demand Proxy — FREE (Yahoo Finance)
+
+    TAN rallying = solar demand rising = silver industrial demand rising.
+    Silver has industrial demand thesis beyond just being a precious metal.
+    """
+    name = "Solar ETF (TAN)"
+    cost = "FREE"
+    category = SignalCategory.METALS
+    poll_interval_minutes = 240
+    reliability = 0.60
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/TAN",
+            params={"interval": "1d", "range": "20d"}
+        )
+
+        if data and "chart" in data:
+            try:
+                result = data["chart"]["result"][0]
+                closes = result["indicators"]["quote"][0]["close"]
+                tan_current = closes[-1] if closes else None
+                tan_10d_ago = closes[-10] if len(closes) >= 10 else None
+
+                if tan_current and tan_10d_ago:
+                    change_10d = ((tan_current - tan_10d_ago) / tan_10d_ago * 100)
+
+                    if change_10d > 5:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("tan_rally", datetime.now().date()),
+                            name=f"Solar ETF Rallying: TAN +{change_10d:.1f}% — Silver Demand Signal",
+                            source_name="Solar ETF (TAN)",
+                            source_api="Yahoo Finance TAN",
+                            category=SignalCategory.METALS,
+                            priority=SignalPriority.MEDIUM,
+                            direction=0.5,
+                            strength=min(0.7, change_10d / 10),
+                            description=(
+                                f"TAN up {change_10d:.1f}% over 10 days. Solar demand rising = "
+                                f"silver industrial demand rising. Silver has dual use case: "
+                                f"monetary metal + industrial demand from solar/EV."
+                            ),
+                            affected_assets=["SLV", "SI", "PSLV", "SIL"],
+                            trade_implications=[
+                                "Bullish for silver medium-term",
+                                "Consider SLV calls on pullbacks",
+                                "Silver miners (SIL) benefit from industrial demand"
+                            ],
+                            opportunities=[
+                                "Solar demand = structural silver demand",
+                                "AI data centers need solar = more silver demand"
+                            ],
+                            raw_data={"tan_price": tan_current, "change_10d": change_10d},
+                            ttl_hours=48.0,
+                            reliability_score=self.reliability
+                        ))
+                    elif change_10d < -10:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("tan_drop", datetime.now().date()),
+                            name=f"Solar ETF Dropping: TAN {change_10d:.1f}%",
+                            source_name="Solar ETF (TAN)",
+                            source_api="Yahoo Finance TAN",
+                            category=SignalCategory.METALS,
+                            priority=SignalPriority.LOW,
+                            direction=-0.3,
+                            strength=min(0.5, abs(change_10d) / 15),
+                            description=f"TAN down {abs(change_10d):.1f}%. Weak solar sector = headwind for silver industrial demand.",
+                            affected_assets=["SLV", "SIL"],
+                            trade_implications=["Silver may face headwinds from weak industrial demand"],
+                            opportunities=["May present buying opportunity if fundamentals intact"],
+                            raw_data={"tan_price": tan_current, "change_10d": change_10d},
+                            ttl_hours=48.0,
+                            reliability_score=0.50
+                        ))
+            except (KeyError, IndexError, TypeError):
+                pass
+        return signals
+
+
+class CreditSpreadMonitor(BaseConnector):
+    """Source 34: Credit Spreads (HYG/LQD Ratio) — FREE (Yahoo Finance)
+
+    Widening credit spreads = risk-off approaching.
+    HYG (junk bonds) underperforming LQD (investment grade) = stress signal.
+    """
+    name = "Credit Spread Monitor"
+    cost = "FREE"
+    category = SignalCategory.RATES
+    poll_interval_minutes = 60
+    reliability = 0.78
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+
+        # Fetch HYG (High Yield Corporate)
+        hyg_data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/HYG",
+            params={"interval": "1d", "range": "20d"}
+        )
+
+        # Fetch LQD (Investment Grade Corporate)
+        lqd_data = self._get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/LQD",
+            params={"interval": "1d", "range": "20d"}
+        )
+
+        if hyg_data and lqd_data and "chart" in hyg_data and "chart" in lqd_data:
+            try:
+                hyg_closes = hyg_data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                lqd_closes = lqd_data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+
+                hyg_current = hyg_closes[-1] if hyg_closes else None
+                lqd_current = lqd_closes[-1] if lqd_closes else None
+                hyg_10d = hyg_closes[-10] if len(hyg_closes) >= 10 else None
+                lqd_10d = lqd_closes[-10] if len(lqd_closes) >= 10 else None
+
+                if hyg_current and lqd_current and hyg_10d and lqd_10d:
+                    ratio_current = hyg_current / lqd_current
+                    ratio_10d = hyg_10d / lqd_10d
+                    ratio_change = ((ratio_current - ratio_10d) / ratio_10d * 100)
+
+                    # HYG underperforming LQD = spreads widening = risk-off
+                    if ratio_change < -1:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("credit_widen", datetime.now().date()),
+                            name=f"Credit Spreads Widening: HYG/LQD {ratio_change:.1f}%",
+                            source_name="Credit Spread Monitor",
+                            source_api="Yahoo Finance HYG/LQD",
+                            category=SignalCategory.RATES,
+                            priority=SignalPriority.HIGH if ratio_change < -2 else SignalPriority.MEDIUM,
+                            direction=-0.6,
+                            strength=min(1.0, abs(ratio_change) / 3),
+                            description=(
+                                f"HYG/LQD ratio down {abs(ratio_change):.1f}% over 10 days. "
+                                f"Credit spreads widening = junk bonds underperforming = stress building. "
+                                f"This leads equity corrections by 1-3 weeks."
+                            ),
+                            affected_assets=["SPY", "HYG", "JNK", "IWM", "XLF"],
+                            trade_implications=[
+                                "Reduce risk exposure — credit leads equities",
+                                "Avoid high-yield bonds (HYG, JNK)",
+                                "Small caps (IWM) and financials (XLF) most exposed",
+                                "Consider SPY puts if spread widening accelerates"
+                            ],
+                            opportunities=[
+                                "Credit stress = buy opportunity after capitulation",
+                                "Wide spreads eventually compress = HYG rally opportunity"
+                            ],
+                            raw_data={
+                                "hyg": hyg_current, "lqd": lqd_current,
+                                "ratio": ratio_current, "ratio_change": ratio_change
+                            },
+                            ttl_hours=24.0,
+                            reliability_score=self.reliability
+                        ))
+                    elif ratio_change > 1:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("credit_tight", datetime.now().date()),
+                            name=f"Credit Spreads Tightening: HYG/LQD +{ratio_change:.1f}%",
+                            source_name="Credit Spread Monitor",
+                            source_api="Yahoo Finance HYG/LQD",
+                            category=SignalCategory.RATES,
+                            priority=SignalPriority.LOW,
+                            direction=0.4,
+                            strength=min(0.6, ratio_change / 3),
+                            description=(
+                                f"HYG/LQD ratio up {ratio_change:.1f}%. Credit spreads tightening = "
+                                f"risk appetite improving. Supportive for equities."
+                            ),
+                            affected_assets=["SPY", "HYG", "IWM"],
+                            trade_implications=["Risk-on environment", "Small caps may outperform"],
+                            opportunities=["Tight spreads support equity valuations"],
+                            raw_data={"ratio": ratio_current, "ratio_change": ratio_change},
+                            ttl_hours=48.0,
+                            reliability_score=self.reliability
+                        ))
+            except (KeyError, IndexError, TypeError):
+                pass
+        return signals
+
+
+# ───────────────────────────────────────────────────────────
 #  CATEGORY 6: PREDICTION MARKETS (Source 23)
 # ───────────────────────────────────────────────────────────
 
@@ -1243,6 +1792,1002 @@ class PolymarketMonitor(BaseConnector):
         return signals
 
 
+class KalshiMonitor(BaseConnector):
+    """Source 32: Kalshi Prediction Market — FREE (Demo API)
+
+    Regulated US prediction market with odds on economic events.
+    Compare to options-implied probabilities for arbitrage.
+    """
+    name = "Kalshi Prediction Market"
+    api_url = "https://demo-api.kalshi.co/trade-api/v2/markets"
+    cost = "FREE"
+    category = SignalCategory.MACRO
+    poll_interval_minutes = 120
+    reliability = 0.55
+
+    WATCHED_KEYWORDS = ["fed", "rate", "inflation", "recession", "gdp", "unemployment", "cpi"]
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(self.api_url, params={"limit": 50, "status": "open"})
+
+        if not data or "markets" not in data:
+            return signals
+
+        for market in data.get("markets", []):
+            title = (market.get("title", "") or "").lower()
+            if any(k in title for k in self.WATCHED_KEYWORDS):
+                try:
+                    yes_price = market.get("yes_bid", 0) or 0
+                    if isinstance(yes_price, str):
+                        yes_price = float(yes_price) / 100
+
+                    if yes_price > 0:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("kalshi", market.get("ticker", "")),
+                            name=f"Kalshi: {market.get('title', '')[:70]}",
+                            source_name="Kalshi",
+                            source_api="demo-api.kalshi.co",
+                            category=SignalCategory.MACRO,
+                            priority=SignalPriority.LOW,
+                            direction=0.0,
+                            strength=yes_price if yes_price <= 1 else yes_price / 100,
+                            description=(
+                                f"Kalshi prediction market: {yes_price*100:.0f}% probability. "
+                                f"Regulated US market — compare to options pricing for arbitrage."
+                            ),
+                            affected_assets=["SPY", "TLT", "GLD"],
+                            trade_implications=[
+                                "If Kalshi diverges from options pricing, trade the gap",
+                                "Prediction markets aggregate crowd wisdom"
+                            ],
+                            opportunities=["Regulated prediction markets = legal betting on events"],
+                            raw_data={"title": market.get("title"), "yes_price": yes_price},
+                            ttl_hours=24.0,
+                            reliability_score=self.reliability
+                        ))
+                except (ValueError, TypeError):
+                    pass
+        return signals
+
+
+class DeribitOptionsMonitor(BaseConnector):
+    """Source 7: Deribit Bitcoin Options — FREE (Public API)
+
+    Crypto options market — shows IV, skew, and term structure.
+    Put/call ratio and IV spikes signal crypto direction.
+    """
+    name = "Deribit BTC Options"
+    api_url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+    cost = "FREE"
+    category = SignalCategory.CRYPTO
+    poll_interval_minutes = 60
+    reliability = 0.70
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        data = self._get(self.api_url, params={"currency": "BTC", "kind": "option"})
+
+        if not data or "result" not in data:
+            return signals
+
+        options = data.get("result", [])
+        if not options:
+            return signals
+
+        # Aggregate put/call OI and volume
+        total_put_oi = 0
+        total_call_oi = 0
+        total_put_vol = 0
+        total_call_vol = 0
+        iv_sum = 0
+        iv_count = 0
+
+        for opt in options:
+            instrument = opt.get("instrument_name", "")
+            oi = opt.get("open_interest", 0) or 0
+            vol = opt.get("volume", 0) or 0
+            mark_iv = opt.get("mark_iv", 0) or 0
+
+            if "-P" in instrument:
+                total_put_oi += oi
+                total_put_vol += vol
+            elif "-C" in instrument:
+                total_call_oi += oi
+                total_call_vol += vol
+
+            if mark_iv > 0:
+                iv_sum += mark_iv
+                iv_count += 1
+
+        avg_iv = iv_sum / iv_count if iv_count > 0 else 0
+        pc_ratio_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 1
+        pc_ratio_vol = total_put_vol / total_call_vol if total_call_vol > 0 else 1
+
+        # High put/call ratio = bearish positioning
+        if pc_ratio_oi > 0.7:
+            signals.append(DetectedSignal(
+                id=self._make_id("deribit_pc", int(pc_ratio_oi * 100)),
+                name=f"Deribit Put/Call Ratio: {pc_ratio_oi:.2f} — {'Elevated' if pc_ratio_oi > 0.8 else 'Above Average'}",
+                source_name="Deribit Options",
+                source_api="deribit.com/api/v2",
+                category=SignalCategory.CRYPTO,
+                priority=SignalPriority.MEDIUM if pc_ratio_oi > 0.8 else SignalPriority.LOW,
+                direction=-0.4 if pc_ratio_oi > 0.8 else -0.2,
+                strength=min(0.8, pc_ratio_oi),
+                description=(
+                    f"BTC options P/C ratio (OI): {pc_ratio_oi:.2f}, (volume): {pc_ratio_vol:.2f}. "
+                    f"Avg IV: {avg_iv:.1f}%. {'Elevated put buying = hedging activity or bearish bets.' if pc_ratio_oi > 0.8 else 'Slightly elevated put interest.'}"
+                ),
+                affected_assets=["BTC/USD", "COIN", "MARA", "MSTR"],
+                trade_implications=[
+                    "Monitor for put-heavy flow = potential correction ahead",
+                    "Contrarian: extreme put ratios often precede rallies"
+                ],
+                opportunities=["Options flow signals institutional positioning"],
+                raw_data={
+                    "put_oi": total_put_oi, "call_oi": total_call_oi,
+                    "pc_ratio_oi": pc_ratio_oi, "avg_iv": avg_iv
+                },
+                ttl_hours=8.0,
+                reliability_score=self.reliability
+            ))
+
+        # High IV = volatility expected
+        if avg_iv > 70:
+            signals.append(DetectedSignal(
+                id=self._make_id("deribit_iv", int(avg_iv)),
+                name=f"BTC Options IV Elevated: {avg_iv:.1f}%",
+                source_name="Deribit Options",
+                source_api="deribit.com/api/v2",
+                category=SignalCategory.CRYPTO,
+                priority=SignalPriority.HIGH if avg_iv > 90 else SignalPriority.MEDIUM,
+                direction=0.0,
+                strength=min(1.0, avg_iv / 100),
+                description=(
+                    f"BTC options IV averaging {avg_iv:.1f}%. Elevated IV = market expects "
+                    f"significant move. Options are expensive — consider selling premium "
+                    f"or waiting for IV crush."
+                ),
+                affected_assets=["BTC/USD"],
+                trade_implications=[
+                    "Expensive to buy options — consider spreads",
+                    "Sell premium if you think move is priced in",
+                    "Straddles/strangles expensive but may pay off"
+                ],
+                opportunities=["High IV = high premium for options sellers"],
+                raw_data={"avg_iv": avg_iv},
+                ttl_hours=12.0,
+                reliability_score=self.reliability
+            ))
+
+        return signals
+
+
+class TreasuryAuctionMonitor(BaseConnector):
+    """Source 11: Treasury Auction Results — FREE (Fiscal Data API)
+
+    Weak bid-to-cover = yields spike, sell TLT.
+    Tail (auction yield vs when-issued) signals demand weakness.
+    """
+    name = "Treasury Auctions"
+    api_url = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/auctions_query"
+    cost = "FREE"
+    category = SignalCategory.RATES
+    poll_interval_minutes = 360
+    reliability = 0.80
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        # Get recent auction results
+        data = self._get(self.api_url, params={
+            "sort": "-auction_date",
+            "page[size]": 10,
+            "filter": "security_type:eq:Note,security_type:eq:Bond"
+        })
+
+        if not data or "data" not in data:
+            return signals
+
+        for auction in data.get("data", [])[:5]:
+            try:
+                security_type = auction.get("security_type", "")
+                security_term = auction.get("security_term", "")
+                auction_date = auction.get("auction_date", "")
+                high_yield = float(auction.get("high_investment_rate", 0) or 0)
+                bid_to_cover = float(auction.get("bid_to_cover_ratio", 0) or 0)
+                allotted_pct = float(auction.get("primary_dealer_accepted", 0) or 0)
+
+                # Check if auction is recent (within 3 days)
+                if auction_date:
+                    auction_dt = datetime.strptime(auction_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    age_days = (datetime.now(timezone.utc) - auction_dt).days
+                    if age_days > 3:
+                        continue
+
+                # Weak auction: low bid-to-cover or high primary dealer take
+                if bid_to_cover > 0 and bid_to_cover < 2.3:
+                    signals.append(DetectedSignal(
+                        id=self._make_id("auction_weak", security_term, auction_date),
+                        name=f"Weak Treasury Auction: {security_term} — BTC {bid_to_cover:.2f}x",
+                        source_name="Treasury Auctions",
+                        source_api="api.fiscaldata.treasury.gov",
+                        category=SignalCategory.RATES,
+                        priority=SignalPriority.HIGH if bid_to_cover < 2.0 else SignalPriority.MEDIUM,
+                        direction=-0.5,
+                        strength=min(1.0, (2.5 - bid_to_cover) / 0.5),
+                        description=(
+                            f"{security_term} {security_type} auction on {auction_date}: "
+                            f"Bid-to-cover {bid_to_cover:.2f}x (weak < 2.3x). High yield: {high_yield:.3f}%. "
+                            f"Weak auction = yields may spike further. Bearish TLT."
+                        ),
+                        affected_assets=["TLT", "IEF", "SHY", "SPY"],
+                        trade_implications=[
+                            "Sell TLT rallies — weak demand = higher yields",
+                            "Rising yields pressure growth stocks (QQQ)",
+                            "Watch for further auction weakness"
+                        ],
+                        opportunities=[
+                            "Weak auctions = buying opportunity for contrarians when sentiment capitulates",
+                            "Higher yields = better entry for bond investors eventually"
+                        ],
+                        raw_data={
+                            "security_term": security_term, "bid_to_cover": bid_to_cover,
+                            "high_yield": high_yield, "auction_date": auction_date
+                        },
+                        ttl_hours=72.0,
+                        reliability_score=self.reliability
+                    ))
+                elif bid_to_cover > 2.8:
+                    signals.append(DetectedSignal(
+                        id=self._make_id("auction_strong", security_term, auction_date),
+                        name=f"Strong Treasury Auction: {security_term} — BTC {bid_to_cover:.2f}x",
+                        source_name="Treasury Auctions",
+                        source_api="api.fiscaldata.treasury.gov",
+                        category=SignalCategory.RATES,
+                        priority=SignalPriority.MEDIUM,
+                        direction=0.4,
+                        strength=min(0.7, (bid_to_cover - 2.5) / 0.5),
+                        description=(
+                            f"{security_term} auction with strong demand: {bid_to_cover:.2f}x bid-to-cover. "
+                            f"Strong demand = yields may decline. Bullish TLT."
+                        ),
+                        affected_assets=["TLT", "IEF"],
+                        trade_implications=["Consider TLT calls on pullbacks"],
+                        opportunities=["Strong demand signals flight to safety"],
+                        raw_data={"security_term": security_term, "bid_to_cover": bid_to_cover},
+                        ttl_hours=72.0,
+                        reliability_score=self.reliability
+                    ))
+            except (ValueError, TypeError, KeyError):
+                continue
+
+        return signals
+
+
+class SECEDGARMonitor(BaseConnector):
+    """Source 25: SEC EDGAR Filings — FREE
+
+    Monitor Form 4 (insider trading) for unusual selling patterns.
+    Heavy insider selling in SaaS companies post-AI launch = bearish.
+    """
+    name = "SEC EDGAR Filings"
+    api_url = "https://efts.sec.gov/LATEST/search-index"
+    cost = "FREE"
+    category = SignalCategory.EQUITIES
+    poll_interval_minutes = 360
+    reliability = 0.65
+
+    # SaaS/Tech companies to monitor for insider selling
+    WATCHED_TICKERS = ["CRM", "ADBE", "WDAY", "NOW", "SHOP", "ZS", "CRWD", "SNOW", "MDB"]
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+
+        # SEC EDGAR full-text search for Form 4 filings
+        for ticker in self.WATCHED_TICKERS:
+            search_url = f"https://efts.sec.gov/LATEST/search-index?q={ticker}&dateRange=custom&startdt=2026-02-01&enddt=2026-02-10&forms=4"
+            data = self._get(search_url)
+
+            if not data:
+                continue
+
+            # Alternative: use SEC RSS feed for Form 4
+            rss_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=4&dateb=&owner=include&count=10&output=atom"
+            rss_text = self._get_text(rss_url)
+
+            if rss_text and HAS_BS4:
+                try:
+                    soup = BeautifulSoup(rss_text, "xml")
+                    entries = soup.find_all("entry")
+
+                    sale_count = 0
+                    for entry in entries[:5]:
+                        title = entry.find("title")
+                        if title and "sale" in title.get_text().lower():
+                            sale_count += 1
+
+                    if sale_count >= 2:
+                        signals.append(DetectedSignal(
+                            id=self._make_id("sec_insider", ticker, datetime.now().date()),
+                            name=f"Insider Selling: {ticker} — {sale_count} Form 4s",
+                            source_name="SEC EDGAR",
+                            source_api="efts.sec.gov",
+                            category=SignalCategory.EQUITIES,
+                            priority=SignalPriority.MEDIUM,
+                            direction=-0.5,
+                            strength=min(0.7, sale_count / 4),
+                            description=(
+                                f"{ticker} has {sale_count} insider sale Form 4 filings recently. "
+                                f"Heavy insider selling often precedes weakness. Especially relevant "
+                                f"for SaaS names exposed to AI disruption."
+                            ),
+                            affected_assets=[ticker, "IGV"],
+                            trade_implications=[
+                                f"Consider puts on {ticker} if selling persists",
+                                "Insiders selling = they see something we don't"
+                            ],
+                            opportunities=["Track insider buying for contrarian signals"],
+                            raw_data={"ticker": ticker, "sale_count": sale_count},
+                            ttl_hours=48.0,
+                            reliability_score=self.reliability
+                        ))
+                except Exception:
+                    pass
+
+        return signals
+
+
+# ───────────────────────────────────────────────────────────
+#  CATEGORY 7: WEB SCRAPING CONNECTORS
+# ───────────────────────────────────────────────────────────
+
+class ClevelandFedNowcast(BaseConnector):
+    """Source 12: Cleveland Fed Inflation Nowcast — FREE (scrape)
+
+    Real-time CPI estimate updated daily. Gives edge before official release.
+    """
+    name = "Cleveland Fed Nowcast"
+    api_url = "https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting"
+    cost = "FREE"
+    category = SignalCategory.MACRO
+    poll_interval_minutes = 720  # Check twice daily
+    reliability = 0.75
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        html = self._get_text(self.api_url)
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            # Look for nowcast value in the page
+            text = soup.get_text()
+
+            # Search for patterns like "CPI: 3.2%" or "nowcast: 3.1%"
+            import re
+            patterns = [
+                r"CPI[:\s]+(\d+\.\d+)%",
+                r"nowcast[:\s]+(\d+\.\d+)%",
+                r"inflation[:\s]+(\d+\.\d+)%"
+            ]
+
+            nowcast_value = None
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    nowcast_value = float(match.group(1))
+                    break
+
+            if nowcast_value:
+                if nowcast_value > 3.5:
+                    signals.append(DetectedSignal(
+                        id=self._make_id("cle_nowcast", int(nowcast_value * 10)),
+                        name=f"Cleveland Fed Nowcast: {nowcast_value:.1f}% — Hot Inflation",
+                        source_name="Cleveland Fed",
+                        source_api="clevelandfed.org/inflation-nowcasting",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.HIGH,
+                        direction=-0.5,
+                        strength=min(1.0, (nowcast_value - 2.5) / 2),
+                        description=(
+                            f"Cleveland Fed nowcasting CPI at {nowcast_value:.1f}%. "
+                            f"Above Fed's 2% target = hawkish pressure. Hot CPI reading "
+                            f"likely at official release. Bearish for equities and bonds."
+                        ),
+                        affected_assets=["SPY", "TLT", "QQQ", "GLD"],
+                        trade_implications=[
+                            "Position for hot CPI print — sell TLT rallies",
+                            "Growth stocks (QQQ) vulnerable to rate pressure",
+                            "Gold benefits from inflation but hurt by higher rates"
+                        ],
+                        opportunities=["Pre-position before official CPI release"],
+                        raw_data={"nowcast": nowcast_value},
+                        ttl_hours=48.0,
+                        reliability_score=self.reliability
+                    ))
+                elif nowcast_value < 2.5:
+                    signals.append(DetectedSignal(
+                        id=self._make_id("cle_nowcast_cool", int(nowcast_value * 10)),
+                        name=f"Cleveland Fed Nowcast: {nowcast_value:.1f}% — Cool Inflation",
+                        source_name="Cleveland Fed",
+                        source_api="clevelandfed.org/inflation-nowcasting",
+                        category=SignalCategory.MACRO,
+                        priority=SignalPriority.MEDIUM,
+                        direction=0.4,
+                        strength=0.6,
+                        description=(
+                            f"Cleveland Fed nowcasting CPI at {nowcast_value:.1f}%. "
+                            f"Near Fed's target = dovish tilt possible. Bullish bonds and equities."
+                        ),
+                        affected_assets=["TLT", "SPY", "QQQ"],
+                        trade_implications=["Buy TLT calls", "Growth stocks benefit from lower rates"],
+                        opportunities=["Cool inflation = Fed can ease policy"],
+                        raw_data={"nowcast": nowcast_value},
+                        ttl_hours=48.0,
+                        reliability_score=self.reliability
+                    ))
+        except Exception:
+            pass
+
+        return signals
+
+
+class LayoffTracker(BaseConnector):
+    """Source 26: Layoffs.fyi Tracker — FREE (scrape)
+
+    Real-time tech layoff data. Faster than Challenger monthly report.
+    """
+    name = "Layoffs.fyi Tracker"
+    api_url = "https://layoffs.fyi"
+    cost = "FREE"
+    category = SignalCategory.MACRO
+    poll_interval_minutes = 360
+    reliability = 0.60
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        html = self._get_text(self.api_url)
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Look for recent layoff announcements
+            # The site typically has a table or list of recent layoffs
+            tables = soup.find_all("table")
+            layoff_count = 0
+            total_affected = 0
+            recent_companies = []
+
+            for table in tables:
+                rows = table.find_all("tr")
+                for row in rows[:20]:  # Check recent entries
+                    cells = row.find_all("td")
+                    if len(cells) >= 3:
+                        company = cells[0].get_text(strip=True)
+                        try:
+                            count_text = cells[1].get_text(strip=True).replace(",", "")
+                            count = int(re.sub(r'[^\d]', '', count_text)) if count_text else 0
+                            if count > 0:
+                                layoff_count += 1
+                                total_affected += count
+                                if len(recent_companies) < 5:
+                                    recent_companies.append(f"{company}: {count}")
+                        except ValueError:
+                            pass
+
+            if layoff_count >= 3 and total_affected > 1000:
+                signals.append(DetectedSignal(
+                    id=self._make_id("layoffs", layoff_count, datetime.now().date()),
+                    name=f"Tech Layoffs Surge: {total_affected:,} affected",
+                    source_name="Layoffs.fyi",
+                    source_api="layoffs.fyi (scraped)",
+                    category=SignalCategory.MACRO,
+                    priority=SignalPriority.HIGH if total_affected > 5000 else SignalPriority.MEDIUM,
+                    direction=-0.4,
+                    strength=min(0.8, total_affected / 10000),
+                    description=(
+                        f"{layoff_count} companies announced layoffs recently, {total_affected:,} total affected. "
+                        f"Recent: {', '.join(recent_companies[:3])}. "
+                        f"Tech sector stress accelerating. AI disruption narrative confirmed."
+                    ),
+                    affected_assets=["IGV", "QQQ", "ARKK", "XLK"],
+                    trade_implications=[
+                        "Tech sector weakness — consider puts on IGV",
+                        "Growth stocks under pressure",
+                        "AI names may benefit as companies automate"
+                    ],
+                    opportunities=[
+                        "Layoffs = cost cutting = potential margin improvement later",
+                        "Oversold quality names may be buying opportunities"
+                    ],
+                    raw_data={"layoff_count": layoff_count, "total_affected": total_affected},
+                    ttl_hours=24.0,
+                    reliability_score=self.reliability
+                ))
+        except Exception:
+            pass
+
+        return signals
+
+
+class FedFundsFutures(BaseConnector):
+    """Source 16: CME FedWatch Fed Funds Futures — FREE (scrape)
+
+    Rate cut probability for upcoming meetings.
+    Market pricing vs Fed dots = positioning opportunity.
+    """
+    name = "Fed Funds Futures"
+    api_url = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
+    cost = "FREE"
+    category = SignalCategory.RATES
+    poll_interval_minutes = 120
+    reliability = 0.80
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        html = self._get_text(self.api_url)
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text()
+
+            # Look for probability patterns
+            cut_prob = None
+            hike_prob = None
+
+            # Search for patterns like "75% probability of cut" or "cut: 75%"
+            cut_match = re.search(r'cut[:\s]+(\d+(?:\.\d+)?)%', text, re.IGNORECASE)
+            hold_match = re.search(r'hold[:\s]+(\d+(?:\.\d+)?)%', text, re.IGNORECASE)
+            hike_match = re.search(r'hike[:\s]+(\d+(?:\.\d+)?)%', text, re.IGNORECASE)
+
+            if cut_match:
+                cut_prob = float(cut_match.group(1))
+            if hike_match:
+                hike_prob = float(hike_match.group(1))
+
+            if cut_prob and cut_prob > 50:
+                signals.append(DetectedSignal(
+                    id=self._make_id("fedwatch_cut", int(cut_prob)),
+                    name=f"FedWatch: {cut_prob:.0f}% Cut Probability",
+                    source_name="CME FedWatch",
+                    source_api="cmegroup.com/fedwatch",
+                    category=SignalCategory.RATES,
+                    priority=SignalPriority.HIGH if cut_prob > 70 else SignalPriority.MEDIUM,
+                    direction=0.5,
+                    strength=min(1.0, cut_prob / 100),
+                    description=(
+                        f"Fed funds futures pricing {cut_prob:.0f}% probability of rate cut. "
+                        f"Market expects easing. Bullish for TLT and risk assets if cut materializes."
+                    ),
+                    affected_assets=["TLT", "SPY", "QQQ", "GLD", "BTC/USD"],
+                    trade_implications=[
+                        "Buy TLT calls ahead of FOMC",
+                        "Growth stocks benefit from lower rates",
+                        "Gold and crypto bullish on rate cuts"
+                    ],
+                    opportunities=["Rate cut = risk-on environment"],
+                    raw_data={"cut_probability": cut_prob},
+                    ttl_hours=24.0,
+                    reliability_score=self.reliability
+                ))
+            elif hike_prob and hike_prob > 30:
+                signals.append(DetectedSignal(
+                    id=self._make_id("fedwatch_hike", int(hike_prob)),
+                    name=f"FedWatch: {hike_prob:.0f}% Hike Probability",
+                    source_name="CME FedWatch",
+                    source_api="cmegroup.com/fedwatch",
+                    category=SignalCategory.RATES,
+                    priority=SignalPriority.HIGH,
+                    direction=-0.6,
+                    strength=min(1.0, hike_prob / 100),
+                    description=(
+                        f"Fed funds futures pricing {hike_prob:.0f}% probability of rate HIKE. "
+                        f"Hawkish surprise risk. Bearish for risk assets."
+                    ),
+                    affected_assets=["TLT", "SPY", "QQQ", "GLD"],
+                    trade_implications=["Sell TLT", "Reduce equity exposure", "Strong dollar ahead"],
+                    opportunities=["Hike = buy bonds after the move"],
+                    raw_data={"hike_probability": hike_prob},
+                    ttl_hours=24.0,
+                    reliability_score=self.reliability
+                ))
+        except Exception:
+            pass
+
+        return signals
+
+
+class COMEXInventoryMonitor(BaseConnector):
+    """Source 19: COMEX Gold/Silver Inventory — FREE (scrape)
+
+    Physical inventory drawdowns = supply tightness.
+    Paper price crash + physical tightness = opportunity.
+    """
+    name = "COMEX Inventory Monitor"
+    api_url = "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsYTDReport.pdf"
+    cost = "FREE"
+    category = SignalCategory.METALS
+    poll_interval_minutes = 720
+    reliability = 0.70
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        # COMEX publishes daily delivery data
+        # Alternative: scrape from CME daily metals reports
+
+        html = self._get_text("https://www.cmegroup.com/clearing/operations-and-deliveries/nymex-delivery-notices.html")
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text().lower()
+
+            # Look for gold/silver delivery notices
+            gold_deliveries = 0
+            silver_deliveries = 0
+
+            gold_match = re.search(r'gold[:\s]+(\d+)', text)
+            silver_match = re.search(r'silver[:\s]+(\d+)', text)
+
+            if gold_match:
+                gold_deliveries = int(gold_match.group(1))
+            if silver_match:
+                silver_deliveries = int(silver_match.group(1))
+
+            # High delivery = physical demand, draining inventory
+            if gold_deliveries > 1000 or silver_deliveries > 500:
+                signals.append(DetectedSignal(
+                    id=self._make_id("comex_drain", gold_deliveries + silver_deliveries),
+                    name=f"COMEX Inventory Drain: Gold {gold_deliveries}, Silver {silver_deliveries}",
+                    source_name="COMEX Delivery Reports",
+                    source_api="cmegroup.com/delivery",
+                    category=SignalCategory.METALS,
+                    priority=SignalPriority.MEDIUM,
+                    direction=0.5,
+                    strength=min(0.7, (gold_deliveries + silver_deliveries) / 2000),
+                    description=(
+                        f"Elevated COMEX deliveries: Gold {gold_deliveries}, Silver {silver_deliveries}. "
+                        f"Physical demand draining registered inventory. Paper price weakness "
+                        f"creates opportunity as physical supply tightens."
+                    ),
+                    affected_assets=["GLD", "SLV", "PSLV", "GDX"],
+                    trade_implications=[
+                        "Physical supply tightening = bullish medium-term",
+                        "Paper vs physical divergence = accumulation signal"
+                    ],
+                    opportunities=["Physical metal accumulation opportunity"],
+                    raw_data={"gold": gold_deliveries, "silver": silver_deliveries},
+                    ttl_hours=48.0,
+                    reliability_score=self.reliability
+                ))
+        except Exception:
+            pass
+
+        return signals
+
+
+class WorldGoldCouncilMonitor(BaseConnector):
+    """Source 20: World Gold Council ETF Flows — FREE (scrape)
+
+    Central bank buying + ETF flows = gold demand picture.
+    """
+    name = "World Gold Council"
+    api_url = "https://www.gold.org/goldhub/data/gold-etfs-holdings-and-flows"
+    cost = "FREE"
+    category = SignalCategory.METALS
+    poll_interval_minutes = 720
+    reliability = 0.75
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        html = self._get_text(self.api_url)
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text()
+
+            # Look for ETF flow data
+            inflow_match = re.search(r'inflow[s]?[:\s]+\$?(\d+(?:\.\d+)?)\s*(billion|million|B|M)', text, re.IGNORECASE)
+            outflow_match = re.search(r'outflow[s]?[:\s]+\$?(\d+(?:\.\d+)?)\s*(billion|million|B|M)', text, re.IGNORECASE)
+
+            if inflow_match:
+                amount = float(inflow_match.group(1))
+                unit = inflow_match.group(2).lower()
+                if 'b' in unit:
+                    amount *= 1000  # Convert to millions
+
+                if amount > 500:  # >$500M inflows
+                    signals.append(DetectedSignal(
+                        id=self._make_id("wgc_inflow", int(amount)),
+                        name=f"Gold ETF Inflows: ${amount:.0f}M",
+                        source_name="World Gold Council",
+                        source_api="gold.org/goldhub",
+                        category=SignalCategory.METALS,
+                        priority=SignalPriority.MEDIUM,
+                        direction=0.5,
+                        strength=min(0.8, amount / 1000),
+                        description=(
+                            f"Gold ETFs seeing ${amount:.0f}M in inflows. "
+                            f"Institutional gold demand rising. Bullish for gold."
+                        ),
+                        affected_assets=["GLD", "IAU", "GDX", "GOLD"],
+                        trade_implications=["Buy gold dips", "Miners benefit from flows"],
+                        opportunities=["ETF flows = institutional demand signal"],
+                        raw_data={"inflow_millions": amount},
+                        ttl_hours=72.0,
+                        reliability_score=self.reliability
+                    ))
+            elif outflow_match:
+                amount = float(outflow_match.group(1))
+                unit = outflow_match.group(2).lower()
+                if 'b' in unit:
+                    amount *= 1000
+
+                if amount > 500:
+                    signals.append(DetectedSignal(
+                        id=self._make_id("wgc_outflow", int(amount)),
+                        name=f"Gold ETF Outflows: ${amount:.0f}M",
+                        source_name="World Gold Council",
+                        source_api="gold.org/goldhub",
+                        category=SignalCategory.METALS,
+                        priority=SignalPriority.MEDIUM,
+                        direction=-0.4,
+                        strength=min(0.7, amount / 1000),
+                        description=(
+                            f"Gold ETFs seeing ${amount:.0f}M in outflows. "
+                            f"Institutional selling pressure. May create buying opportunity."
+                        ),
+                        affected_assets=["GLD", "GDX"],
+                        trade_implications=["Wait for outflows to slow before buying"],
+                        opportunities=["Heavy outflows often precede reversals"],
+                        raw_data={"outflow_millions": amount},
+                        ttl_hours=72.0,
+                        reliability_score=self.reliability
+                    ))
+        except Exception:
+            pass
+
+        return signals
+
+
+class ChallengerLayoffMonitor(BaseConnector):
+    """Source 15: Challenger Job Cuts Report — FREE (scrape)
+
+    Monthly layoff announcements. Jan 2026 showed 108K cuts — highest since 2009.
+    """
+    name = "Challenger Layoffs"
+    api_url = "https://www.challengergray.com/press/press-releases"
+    cost = "FREE"
+    category = SignalCategory.MACRO
+    poll_interval_minutes = 720
+    reliability = 0.80
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+        html = self._get_text(self.api_url)
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Look for recent press releases with layoff data
+            for article in soup.find_all(["article", "div"], class_=re.compile(r'press|release|article')):
+                text = article.get_text()
+
+                # Look for patterns like "108,000 job cuts" or "layoffs: 108K"
+                cuts_match = re.search(r'(\d{2,3}[,\d]*)\s*(?:job\s*)?(?:cuts?|layoffs?)', text, re.IGNORECASE)
+
+                if cuts_match:
+                    cuts_str = cuts_match.group(1).replace(",", "")
+                    cuts = int(cuts_str)
+
+                    if cuts > 50000:  # Significant monthly total
+                        signals.append(DetectedSignal(
+                            id=self._make_id("challenger", cuts, datetime.now().month),
+                            name=f"Challenger Report: {cuts:,} Job Cuts",
+                            source_name="Challenger Gray & Christmas",
+                            source_api="challengergray.com",
+                            category=SignalCategory.MACRO,
+                            priority=SignalPriority.HIGH if cuts > 80000 else SignalPriority.MEDIUM,
+                            direction=-0.5,
+                            strength=min(1.0, cuts / 100000),
+                            description=(
+                                f"Challenger reports {cuts:,} announced job cuts. "
+                                f"{'HIGHEST since 2009 crisis!' if cuts > 100000 else 'Elevated layoff activity.'} "
+                                f"Labor market stress accelerating. Combined with weak JOLTS = recession signal."
+                            ),
+                            affected_assets=["SPY", "IWM", "XLY", "TLT"],
+                            trade_implications=[
+                                "Buy TLT — rate cut expectations rise",
+                                "Sell consumer discretionary (XLY)",
+                                "Small caps (IWM) most exposed to domestic labor"
+                            ],
+                            opportunities=[
+                                "Labor weakness = Fed pivot = buy bonds",
+                                "Defensive sectors outperform"
+                            ],
+                            raw_data={"job_cuts": cuts},
+                            ttl_hours=168.0,  # Weekly relevance
+                            reliability_score=self.reliability
+                        ))
+                        break
+        except Exception:
+            pass
+
+        return signals
+
+
+class GovShutdownMonitor(BaseConnector):
+    """Source 37: Government Shutdown Tracker — FREE (scrape)
+
+    Data delays = information vacuum = volatility expansion.
+    Shutdown risk affects BLS releases (NFP, CPI).
+    """
+    name = "Gov Shutdown Monitor"
+    api_url = "https://www.congress.gov"
+    cost = "FREE"
+    category = SignalCategory.STRUCTURAL
+    poll_interval_minutes = 360
+    reliability = 0.70
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+
+        # Check news sources for shutdown coverage
+        news_sources = [
+            "https://www.reuters.com/world/us/",
+            "https://apnews.com/hub/us-government"
+        ]
+
+        shutdown_risk = False
+        shutdown_active = False
+
+        for url in news_sources:
+            html = self._get_text(url)
+            if html and HAS_BS4:
+                soup = BeautifulSoup(html, "html.parser")
+                text = soup.get_text().lower()
+
+                if "shutdown" in text and ("government" in text or "federal" in text):
+                    if any(w in text for w in ["imminent", "looming", "approaching", "risk", "threat"]):
+                        shutdown_risk = True
+                    if any(w in text for w in ["begins", "started", "underway", "day 1", "enters"]):
+                        shutdown_active = True
+
+        if shutdown_active:
+            signals.append(DetectedSignal(
+                id=self._make_id("shutdown_active", datetime.now().date()),
+                name="GOVERNMENT SHUTDOWN ACTIVE",
+                source_name="Congress.gov / News",
+                source_api="congress.gov + news scrapers",
+                category=SignalCategory.STRUCTURAL,
+                priority=SignalPriority.CRITICAL,
+                direction=-0.3,
+                strength=0.80,
+                description=(
+                    "Federal government shutdown is active. BLS data releases (NFP, CPI) "
+                    "will be delayed. Information vacuum = elevated volatility. "
+                    "Market hates uncertainty — expect wider swings."
+                ),
+                affected_assets=["SPY", "VIX", "TLT", "GLD"],
+                trade_implications=[
+                    "Buy VIX calls — volatility expansion ahead",
+                    "Straddles on SPX for event risk",
+                    "Safe havens (GLD, TLT) may catch bid"
+                ],
+                opportunities=[
+                    "Shutdown eventually ends — buy the fear",
+                    "Delayed data creates tradable surprises when released"
+                ],
+                raw_data={"status": "active"},
+                ttl_hours=24.0,
+                reliability_score=self.reliability
+            ))
+        elif shutdown_risk:
+            signals.append(DetectedSignal(
+                id=self._make_id("shutdown_risk", datetime.now().date()),
+                name="Government Shutdown Risk Elevated",
+                source_name="Congress.gov / News",
+                source_api="congress.gov + news scrapers",
+                category=SignalCategory.STRUCTURAL,
+                priority=SignalPriority.MEDIUM,
+                direction=-0.2,
+                strength=0.50,
+                description=(
+                    "Government shutdown risk elevated. If shutdown occurs, "
+                    "BLS data releases will be delayed. Prepare for volatility."
+                ),
+                affected_assets=["SPY", "VIX"],
+                trade_implications=["Monitor for resolution", "Consider protective puts"],
+                opportunities=["Pre-position before shutdown if likely"],
+                raw_data={"status": "risk"},
+                ttl_hours=48.0,
+                reliability_score=self.reliability
+            ))
+
+        return signals
+
+
+class ProductHuntMonitor(BaseConnector):
+    """Source 24: Product Hunt AI Launches — FREE (API)
+
+    New AI product launches trending. Early signal for disruption themes.
+    """
+    name = "Product Hunt"
+    api_url = "https://api.producthunt.com/v2/api/graphql"
+    cost = "FREE"
+    category = SignalCategory.AI_DISRUPTION
+    poll_interval_minutes = 240
+    reliability = 0.50
+
+    def fetch_signals(self) -> list[DetectedSignal]:
+        signals = []
+
+        # Product Hunt requires OAuth, but we can scrape their public page
+        html = self._get_text("https://www.producthunt.com/topics/artificial-intelligence")
+
+        if not html or not HAS_BS4:
+            return signals
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Find trending AI products
+            ai_products = []
+            for item in soup.find_all(["div", "article"], class_=re.compile(r'post|product|item')):
+                title_elem = item.find(["h2", "h3", "a"])
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    if any(k in title.lower() for k in ["ai", "gpt", "llm", "agent", "copilot", "automate"]):
+                        ai_products.append(title[:50])
+
+            if len(ai_products) >= 3:
+                signals.append(DetectedSignal(
+                    id=self._make_id("ph_ai", len(ai_products), datetime.now().date()),
+                    name=f"Product Hunt: {len(ai_products)} AI Products Trending",
+                    source_name="Product Hunt",
+                    source_api="producthunt.com (scraped)",
+                    category=SignalCategory.AI_DISRUPTION,
+                    priority=SignalPriority.LOW,
+                    direction=-0.2,
+                    strength=min(0.5, len(ai_products) / 10),
+                    description=(
+                        f"{len(ai_products)} AI products trending on Product Hunt today. "
+                        f"Examples: {', '.join(ai_products[:3])}. "
+                        f"AI product velocity = disruption narrative accelerating."
+                    ),
+                    affected_assets=["IGV", "CRM", "ADBE"],
+                    trade_implications=[
+                        "Monitor for products targeting enterprise SaaS",
+                        "AI disruption theme ongoing"
+                    ],
+                    opportunities=["Early signal for which verticals AI is targeting"],
+                    raw_data={"count": len(ai_products), "products": ai_products[:5]},
+                    ttl_hours=24.0,
+                    reliability_score=self.reliability
+                ))
+        except Exception:
+            pass
+
+        return signals
+
+
 # ═══════════════════════════════════════════════════════════════
 #  SECTION 2: THE SIGNAL ORCHESTRATOR
 #  ─────────────────────────────────────────────────────────────
@@ -1259,26 +2804,44 @@ class SignalOrchestrator:
 
     def __init__(self):
         self.connectors: list[BaseConnector] = [
-            # Crypto (Sources 1-6)
+            # Crypto (Sources 1-7)
             BinanceFundingRate(),
             BinanceOpenInterest(),
             CoinGlassLiquidations(),
             BTCETFFlows(),
             WhaleAlertConnector(),
             TokenUnlocksConnector(),
-            # Macro (Sources 7-8)
-            FREDConnector(),
+            DeribitOptionsMonitor(),
+            # Macro (Sources 8-16) — includes FRED with ISM/ADP
+            FREDConnector(),  # Now includes NAPM (ISM) and ADPMNUSNERSA (ADP)
             EconomicCalendar(),
-            # Metals (Sources 9-10)
+            TreasuryAuctionMonitor(),
+            ClevelandFedNowcast(),
+            ChallengerLayoffMonitor(),
+            LayoffTracker(),
+            FedFundsFutures(),
+            GovShutdownMonitor(),
+            # Metals (Sources 17-21)
             CMEMarginMonitor(),
             ShanghaiGoldPremium(),
-            # AI Disruption (Sources 14-15)
+            COMEXInventoryMonitor(),
+            WorldGoldCouncilMonitor(),
+            SolarETFMonitor(),
+            # AI Disruption (Sources 22-26)
             GitHubAIMonitor(),
             HackerNewsMonitor(),
-            # Volatility (Source 19)
+            ProductHuntMonitor(),
+            SECEDGARMonitor(),
+            # Volatility & Options (Sources 27-30)
             CBOEVIXMonitor(),
-            # Prediction Markets (Source 23)
+            CBOESKEWMonitor(),
+            # Prediction Markets (Sources 31-32)
             PolymarketMonitor(),
+            KalshiMonitor(),
+            # Cross-Asset (Sources 33-36)
+            CopperFuturesMonitor(),
+            CreditSpreadMonitor(),
+            DXYDollarMonitor(),
         ]
 
         self.all_signals: list[DetectedSignal] = []
@@ -1392,51 +2955,50 @@ DATA_SOURCE_REGISTRY = [
     {"id": 4,  "name": "BTC ETF Flows (Farside)",      "api": "farside.co.uk/bitcoin-etf-flow",       "cost": "FREE", "status": "IMPLEMENTED", "category": "crypto",   "poll": "6hr",    "signal": "Institutional buying/selling pressure"},
     {"id": 5,  "name": "Whale Alert",                  "api": "api.whale-alert.io",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "crypto",   "poll": "15min",  "signal": "Large exchange deposits (sell) / withdrawals (accumulate)"},
     {"id": 6,  "name": "Token Unlocks",                "api": "token.unlocks.app",                    "cost": "FREE", "status": "IMPLEMENTED", "category": "crypto",   "poll": "12hr",   "signal": "Predictable supply floods → short before unlock"},
-    {"id": 7,  "name": "Deribit Options Vol Surface",  "api": "deribit.com/api/v2",                   "cost": "FREE", "status": "PLANNED",     "category": "crypto",   "poll": "1hr",    "signal": "Crypto options skew, IV term structure"},
+    {"id": 7,  "name": "Deribit Options Vol Surface",  "api": "deribit.com/api/v2",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "crypto",   "poll": "1hr",    "signal": "Crypto options skew, IV term structure, P/C ratio"},
     {"id": 8,  "name": "Glassnode On-Chain",           "api": "api.glassnode.com",                    "cost": "FREE*","status": "PLANNED",     "category": "crypto",   "poll": "1hr",    "signal": "Exchange reserves, SOPR, MVRV ratio"},
 
     # ── MACRO (8 sources) ──
-    {"id": 9,  "name": "FRED API",                     "api": "api.stlouisfed.org/fred",              "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "6hr",    "signal": "JOLTS, claims, yield curve, credit spreads"},
+    {"id": 9,  "name": "FRED API",                     "api": "api.stlouisfed.org/fred",              "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "6hr",    "signal": "JOLTS, claims, yield curve, credit spreads, ISM, ADP"},
     {"id": 10, "name": "BLS Economic Calendar",        "api": "bls.gov/schedule",                     "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "6hr",    "signal": "NFP, CPI release countdown with pre-event alerts"},
-    {"id": 11, "name": "Treasury Auction Results",     "api": "api.fiscaldata.treasury.gov",           "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "daily",  "signal": "Weak bid-to-cover = yields spike, sell TLT"},
-    {"id": 12, "name": "Cleveland Fed CPI Nowcast",    "api": "clevelandfed.org/indicators",           "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "daily",  "signal": "Real-time CPI estimate before official release"},
-    {"id": 13, "name": "ISM Manufacturing PMI",        "api": "ismworld.org (via FRED)",               "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "monthly","signal": "ISM Prices Paid leads CPI by 2-3 months"},
-    {"id": 14, "name": "ADP Employment",               "api": "adpemploymentreport.com",               "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "monthly","signal": "Leads NFP, showed only 22K in Jan 2026"},
-    {"id": 15, "name": "Challenger Layoff Data",       "api": "challengergray.com",                    "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "monthly","signal": "108K cuts in Jan 2026 — highest since 2009"},
-    {"id": 16, "name": "Fed Funds Futures",            "api": "cmegroup.com/fedwatch",                 "cost": "FREE", "status": "PLANNED",     "category": "macro",    "poll": "1hr",    "signal": "Rate cut probability for next meeting"},
+    {"id": 11, "name": "Treasury Auction Results",     "api": "api.fiscaldata.treasury.gov",          "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "daily",  "signal": "Weak bid-to-cover = yields spike, sell TLT"},
+    {"id": 12, "name": "Cleveland Fed CPI Nowcast",    "api": "clevelandfed.org/indicators",          "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "daily",  "signal": "Real-time CPI estimate before official release"},
+    {"id": 13, "name": "ISM Manufacturing PMI",        "api": "FRED NAPM series",                     "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "monthly","signal": "ISM Prices Paid leads CPI by 2-3 months"},
+    {"id": 14, "name": "ADP Employment",               "api": "FRED ADPMNUSNERSA series",             "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "monthly","signal": "Leads NFP, showed only 22K in Jan 2026"},
+    {"id": 15, "name": "Challenger Layoff Data",       "api": "challengergray.com",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "monthly","signal": "108K cuts in Jan 2026 — highest since 2009"},
+    {"id": 16, "name": "Fed Funds Futures",            "api": "cmegroup.com/fedwatch",                "cost": "FREE", "status": "IMPLEMENTED", "category": "macro",    "poll": "1hr",    "signal": "Rate cut probability for next meeting"},
 
     # ── METALS (5 sources) ──
-    {"id": 17, "name": "CME Margin Advisories",        "api": "cmegroup.com/advisories (scrape)",      "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "2hr",    "signal": "THE #1 crash predictor. Margin hike → liquidation 24-48hr later"},
-    {"id": 18, "name": "Shanghai Gold Premium",        "api": "sge.com.cn (scrape)",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "4hr",    "signal": "Premium = Chinese demand strong. Discount = demand collapsed"},
-    {"id": 19, "name": "COMEX Inventory Data",         "api": "cmegroup.com/delivery",                 "cost": "FREE", "status": "PLANNED",     "category": "metals",   "poll": "daily",  "signal": "Physical inventory drawdowns = supply tightness"},
-    {"id": 20, "name": "World Gold Council Flows",     "api": "gold.org/goldhub",                      "cost": "FREE", "status": "PLANNED",     "category": "metals",   "poll": "weekly", "signal": "Central bank buying data, ETF flows"},
-    {"id": 21, "name": "Silver Institute Demand",      "api": "silverinstitute.org",                   "cost": "FREE", "status": "PLANNED",     "category": "metals",   "poll": "monthly","signal": "Industrial demand (AI/solar) vs paper crash divergence"},
+    {"id": 17, "name": "CME Margin Advisories",        "api": "cmegroup.com/advisories (scrape)",     "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "2hr",    "signal": "THE #1 crash predictor. Margin hike → liquidation 24-48hr later"},
+    {"id": 18, "name": "Shanghai Gold Premium",        "api": "sge.com.cn (scrape)",                  "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "4hr",    "signal": "Premium = Chinese demand strong. Discount = demand collapsed"},
+    {"id": 19, "name": "COMEX Inventory Data",         "api": "cmegroup.com/delivery",                "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "daily",  "signal": "Physical inventory drawdowns = supply tightness"},
+    {"id": 20, "name": "World Gold Council Flows",     "api": "gold.org/goldhub",                     "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "weekly", "signal": "Central bank buying data, ETF flows"},
+    {"id": 21, "name": "Solar ETF Silver Proxy",       "api": "Yahoo Finance TAN",                    "cost": "FREE", "status": "IMPLEMENTED", "category": "metals",   "poll": "daily",  "signal": "TAN rallying = silver industrial demand rising"},
 
     # ── AI DISRUPTION (5 sources) ──
-    {"id": 22, "name": "GitHub AI Lab Repos",          "api": "api.github.com/orgs/*/repos",           "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "2hr",    "signal": "New enterprise AI releases from Anthropic/OpenAI/Google"},
-    {"id": 23, "name": "Hacker News Trends",           "api": "hacker-news.firebaseio.com",            "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "1hr",    "signal": "AI narrative velocity — trends 12-24hr before mainstream"},
-    {"id": 24, "name": "Product Hunt",                 "api": "api.producthunt.com",                   "cost": "FREE", "status": "PLANNED",     "category": "ai",       "poll": "2hr",    "signal": "New AI product launches trending"},
-    {"id": 25, "name": "SEC EDGAR Filings",            "api": "efts.sec.gov/LATEST/search-index",      "cost": "FREE", "status": "PLANNED",     "category": "ai",       "poll": "6hr",    "signal": "Insider selling in SaaS companies post-AI launch"},
-    {"id": 26, "name": "Glassdoor/LinkedIn Layoffs",   "api": "scrape layoff trackers",                "cost": "FREE", "status": "PLANNED",     "category": "ai",       "poll": "daily",  "signal": "Real-time layoff signals (faster than Challenger monthly)"},
+    {"id": 22, "name": "GitHub AI Lab Repos",          "api": "api.github.com/orgs/*/repos",          "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "2hr",    "signal": "New enterprise AI releases from Anthropic/OpenAI/Google"},
+    {"id": 23, "name": "Hacker News Trends",           "api": "hacker-news.firebaseio.com",           "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "1hr",    "signal": "AI narrative velocity — trends 12-24hr before mainstream"},
+    {"id": 24, "name": "Product Hunt",                 "api": "producthunt.com (scrape)",             "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "2hr",    "signal": "New AI product launches trending"},
+    {"id": 25, "name": "SEC EDGAR Filings",            "api": "efts.sec.gov/LATEST/search-index",     "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "6hr",    "signal": "Insider selling in SaaS companies post-AI launch"},
+    {"id": 26, "name": "Layoffs.fyi Tracker",          "api": "layoffs.fyi (scrape)",                 "cost": "FREE", "status": "IMPLEMENTED", "category": "ai",       "poll": "6hr",    "signal": "Real-time layoff signals (faster than Challenger monthly)"},
 
     # ── VOLATILITY & OPTIONS (4 sources) ──
-    {"id": 27, "name": "CBOE VIX Data",               "api": "cboe.com / yahoo finance ^VIX",          "cost": "FREE", "status": "IMPLEMENTED", "category": "options",  "poll": "1hr",    "signal": "VIX level, term structure (contango vs backwardation)"},
-    {"id": 28, "name": "SpotGamma GEX Levels",        "api": "spotgamma.com (free tier)",              "cost": "FREE", "status": "PLANNED",     "category": "options",  "poll": "daily",  "signal": "GEX flip point — above = mean-reverting, below = trending"},
-    {"id": 29, "name": "Unusual Whales Flow",         "api": "unusualwhales.com/api",                  "cost": "$20/mo","status": "PLANNED",    "category": "options",  "poll": "15min",  "signal": "Unusual options activity, dark pool prints, sweep alerts"},
-    {"id": 30, "name": "CBOE SKEW Index",             "api": "cboe.com/skew",                          "cost": "FREE", "status": "PLANNED",     "category": "options",  "poll": "1hr",    "signal": "Tail risk pricing — high SKEW = market fears a crash"},
+    {"id": 27, "name": "CBOE VIX Data",               "api": "Yahoo Finance ^VIX",                    "cost": "FREE", "status": "IMPLEMENTED", "category": "options",  "poll": "1hr",    "signal": "VIX level, term structure (contango vs backwardation)"},
+    {"id": 28, "name": "SpotGamma GEX Levels",        "api": "spotgamma.com (free tier)",             "cost": "FREE", "status": "PLANNED",     "category": "options",  "poll": "daily",  "signal": "GEX flip point — above = mean-reverting, below = trending"},
+    {"id": 29, "name": "Unusual Whales Flow",         "api": "unusualwhales.com/api",                 "cost": "$20/mo","status": "SKIPPED",    "category": "options",  "poll": "15min",  "signal": "Unusual options activity, dark pool prints, sweep alerts"},
+    {"id": 30, "name": "CBOE SKEW Index",             "api": "Yahoo Finance ^SKEW",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "options",  "poll": "1hr",    "signal": "Tail risk pricing — high SKEW = market fears a crash"},
 
     # ── PREDICTION MARKETS (2 sources) ──
-    {"id": 31, "name": "Polymarket",                   "api": "gamma-api.polymarket.com",               "cost": "FREE", "status": "IMPLEMENTED", "category": "prediction","poll": "2hr",   "signal": "Crowd-sourced probabilities vs options-implied = arbitrage"},
-    {"id": 32, "name": "Kalshi",                       "api": "trading-api.kalshi.com",                 "cost": "FREE", "status": "PLANNED",     "category": "prediction","poll": "2hr",   "signal": "Regulated prediction market odds on economic events"},
+    {"id": 31, "name": "Polymarket",                   "api": "gamma-api.polymarket.com",             "cost": "FREE", "status": "IMPLEMENTED", "category": "prediction","poll": "2hr",   "signal": "Crowd-sourced probabilities vs options-implied = arbitrage"},
+    {"id": 32, "name": "Kalshi",                       "api": "demo-api.kalshi.co",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "prediction","poll": "2hr",   "signal": "Regulated prediction market odds on economic events"},
 
     # ── CROSS-ASSET (3 sources) ──
-    {"id": 33, "name": "Copper Futures (HG)",          "api": "Yahoo Finance / CME",                    "cost": "FREE", "status": "PLANNED",     "category": "cross",    "poll": "1hr",    "signal": "Copper leads equities by 24hr. Breakdown = buy SPY puts."},
-    {"id": 34, "name": "Credit Spreads (HYG/LQD)",    "api": "Yahoo Finance HYG LQD ratio",            "cost": "FREE", "status": "PLANNED",     "category": "cross",    "poll": "1hr",    "signal": "Widening credit = risk-off approaching"},
-    {"id": 35, "name": "DXY Dollar Index",            "api": "Yahoo Finance DX-Y.NYB",                 "cost": "FREE", "status": "PLANNED",     "category": "cross",    "poll": "1hr",    "signal": "Dollar strength kills everything: commodities, EM, crypto, gold"},
+    {"id": 33, "name": "Copper Futures (HG)",          "api": "Yahoo Finance HG=F",                   "cost": "FREE", "status": "IMPLEMENTED", "category": "cross",    "poll": "1hr",    "signal": "Copper leads equities by 24hr. Breakdown = buy SPY puts."},
+    {"id": 34, "name": "Credit Spreads (HYG/LQD)",    "api": "Yahoo Finance HYG/LQD ratio",           "cost": "FREE", "status": "IMPLEMENTED", "category": "cross",    "poll": "1hr",    "signal": "Widening credit = risk-off approaching"},
+    {"id": 35, "name": "DXY Dollar Index",            "api": "Yahoo Finance DX-Y.NYB",                "cost": "FREE", "status": "IMPLEMENTED", "category": "cross",    "poll": "1hr",    "signal": "Dollar strength kills everything: commodities, EM, crypto, gold"},
 
-    # ── EXOTIC / ALTERNATIVE (2 sources) ──
-    {"id": 36, "name": "Solar ETF (TAN) as Silver Proxy","api": "Yahoo Finance TAN",                   "cost": "FREE", "status": "PLANNED",     "category": "alternative","poll": "daily", "signal": "TAN rallying = silver industrial demand rising"},
-    {"id": 37, "name": "Gov Shutdown Tracker",         "api": "scrape congress.gov / news",             "cost": "FREE", "status": "PLANNED",     "category": "structural","poll": "daily", "signal": "Data delays = information vacuum = vol expansion"},
+    # ── STRUCTURAL (1 source) ──
+    {"id": 36, "name": "Gov Shutdown Tracker",         "api": "congress.gov + news (scrape)",         "cost": "FREE", "status": "IMPLEMENTED", "category": "structural","poll": "6hr",   "signal": "Data delays = information vacuum = vol expansion"},
 ]
 
 
