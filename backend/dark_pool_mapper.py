@@ -115,10 +115,13 @@ def determine_strength(notional: float, trade_count: int) -> str:
 class DarkPoolMapper:
     """
     Tracks dark pool prints and builds institutional support/resistance levels.
+    Uses Alpaca for trades data (free tier includes trades).
     """
 
-    def __init__(self, polygon_api_key: str = None):
-        self.api_key = polygon_api_key or os.environ.get("POLYGON_API_KEY", "")
+    def __init__(self):
+        self.alpaca_key = os.environ.get("ALPACA_API_KEY", "")
+        self.alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        self.polygon_key = os.environ.get("POLYGON_API_KEY", "")
         self.last_snapshot: Optional[DarkPoolSnapshot] = None
         self.last_update: Optional[datetime] = None
         self._init_db()
@@ -175,27 +178,30 @@ class DarkPoolMapper:
 
     def _fetch_trades(self, ticker: str = "SPY", limit: int = 1000) -> List[dict]:
         """
-        Fetch recent trades from Polygon.
-        Filter for dark pool trades (exchange=4 + trf_id present).
+        Fetch recent trades from Alpaca.
+        Alpaca provides trade data including exchange info for dark pool detection.
         """
-        if not HAS_REQUESTS or not self.api_key:
+        if not HAS_REQUESTS or not self.alpaca_key:
             return []
 
         try:
-            url = f"https://api.polygon.io/v3/trades/{ticker}"
+            url = f"https://data.alpaca.markets/v2/stocks/{ticker}/trades"
+            headers = {
+                "APCA-API-KEY-ID": self.alpaca_key,
+                "APCA-API-SECRET-KEY": self.alpaca_secret
+            }
             params = {
-                "apiKey": self.api_key,
                 "limit": limit,
-                "order": "desc",
-                "sort": "timestamp"
+                "sort": "desc"
             }
 
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get("results", [])
+                # Alpaca returns trades in "trades" key
+                return data.get("trades", [])
             else:
-                log.warning(f"Trades fetch failed: {resp.status_code}")
+                log.warning(f"Alpaca trades fetch failed: {resp.status_code}")
                 return []
 
         except Exception as e:
@@ -252,20 +258,27 @@ class DarkPoolMapper:
             return 0
 
     def _is_dark_pool_trade(self, trade: dict) -> bool:
-        """Check if trade is from dark pool (exchange 4 + trf_id)."""
-        return trade.get("exchange") == 4 and "trf_id" in trade
+        """
+        Check if trade is from dark pool.
+        Alpaca uses exchange codes - 'D' and TRF exchanges indicate dark pool.
+        Also look for odd lot and block trade conditions.
+        """
+        exchange = trade.get("x", "")
+        # Dark pool exchanges: D (ADF/TRF), and others
+        dark_exchanges = {"D", "B", "H", "Y"}  # ADF, NASDAQ BX, MIAX, BYX (often report dark trades)
+        return exchange in dark_exchanges
 
     def _filter_block_trades(self, trades: List[dict], spot_price: float) -> List[dict]:
-        """Filter for institutional block trades."""
+        """
+        Filter for institutional block trades from Alpaca data.
+        Alpaca format: {t: timestamp, x: exchange, p: price, s: size, c: conditions}
+        """
         blocks = []
 
         for trade in trades:
-            # Check if dark pool
-            if not self._is_dark_pool_trade(trade):
-                continue
-
-            size = trade.get("size", 0)
-            price = trade.get("price", 0)
+            # Check if dark pool or large trade
+            size = trade.get("s", 0)
+            price = trade.get("p", 0)
 
             if size < MIN_BLOCK_SIZE:
                 continue
@@ -274,13 +287,17 @@ class DarkPoolMapper:
             if notional < MIN_NOTIONAL:
                 continue
 
+            # Include all large blocks, prioritize dark pool
+            is_dark = self._is_dark_pool_trade(trade)
+
             blocks.append({
                 "price": price,
                 "size": size,
                 "notional": notional,
-                "timestamp": trade.get("participant_timestamp", 0),
-                "conditions": trade.get("conditions", []),
-                "trf_id": trade.get("trf_id")
+                "timestamp": trade.get("t", ""),
+                "conditions": trade.get("c", []),
+                "exchange": trade.get("x", ""),
+                "is_dark": is_dark
             })
 
         return blocks

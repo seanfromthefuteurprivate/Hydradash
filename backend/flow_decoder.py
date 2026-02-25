@@ -67,12 +67,13 @@ class FlowDecoder:
     """
     Decodes institutional options flow using Claude Haiku.
 
-    Flow data comes from Polygon options trades.
+    Flow data comes from Alpaca options trades (free tier).
     Classification is done by Haiku for context-aware analysis.
     """
 
-    def __init__(self, polygon_api_key: str = None):
-        self.polygon_key = polygon_api_key or os.environ.get("POLYGON_API_KEY", "")
+    def __init__(self):
+        self.alpaca_key = os.environ.get("ALPACA_API_KEY", "")
+        self.alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
         self.bedrock = get_bedrock_client()
         self.last_snapshot: Optional[FlowSnapshot] = None
         self.last_update: Optional[datetime] = None
@@ -143,29 +144,39 @@ Always respond with valid JSON only, no explanations."""
             log.error(f"Flow history save error: {e}")
 
     def _fetch_options_trades(self, ticker: str = "SPY", limit: int = 500) -> List[dict]:
-        """Fetch recent options trades from Polygon."""
-        if not HAS_REQUESTS or not self.polygon_key:
+        """Fetch recent options trades from Alpaca."""
+        if not HAS_REQUESTS or not self.alpaca_key:
             return []
 
         try:
-            # Polygon options trades endpoint
-            url = f"https://api.polygon.io/v3/trades/O:{ticker}"
+            # Alpaca options trades endpoint
+            url = "https://data.alpaca.markets/v1beta1/options/trades"
 
-            # Get recent 0DTE options trades
-            today = datetime.now().strftime("%Y-%m-%d")
-
-            params = {
-                "apiKey": self.polygon_key,
-                "limit": limit,
-                "order": "desc",
-                "sort": "timestamp"
+            headers = {
+                "APCA-API-KEY-ID": self.alpaca_key,
+                "APCA-API-SECRET-KEY": self.alpaca_secret
             }
 
-            resp = requests.get(url, params=params, timeout=15)
+            # Get trades for SPY options (all expirations)
+            params = {
+                "symbols": f"{ticker}*",  # Wildcard for all SPY options
+                "limit": limit,
+                "sort": "desc"
+            }
+
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code == 200:
-                return resp.json().get("results", [])
+                data = resp.json()
+                # Alpaca returns trades nested under symbol keys
+                all_trades = []
+                trades_dict = data.get("trades", {})
+                for symbol, trades in trades_dict.items():
+                    for trade in trades:
+                        trade["symbol"] = symbol  # Add symbol to each trade
+                        all_trades.append(trade)
+                return all_trades
             else:
-                log.warning(f"Options trades fetch failed: {resp.status_code}")
+                log.warning(f"Alpaca options trades fetch failed: {resp.status_code}")
                 return []
 
         except Exception as e:
@@ -173,7 +184,10 @@ Always respond with valid JSON only, no explanations."""
             return []
 
     def _aggregate_flow(self, trades: List[dict]) -> dict:
-        """Aggregate flow data from trades."""
+        """
+        Aggregate flow data from Alpaca trades.
+        Alpaca format: {t: timestamp, x: exchange, p: price, s: size, c: conditions, symbol: "SPY260225C00550000"}
+        """
         call_premium = 0
         put_premium = 0
         call_sweeps = 0
@@ -183,25 +197,27 @@ Always respond with valid JSON only, no explanations."""
 
         for trade in trades:
             # Parse option symbol to determine call/put
-            # Format: O:SPY230825C00450000
-            ticker = trade.get("ticker", "")
-            if len(ticker) < 15:
+            # Alpaca format: SPY260225C00550000
+            symbol = trade.get("symbol", "")
+            if len(symbol) < 15:
                 continue
 
-            is_call = "C" in ticker[10:12]
-            is_put = "P" in ticker[10:12]
+            # Find C or P in the symbol (after date portion)
+            is_call = "C" in symbol[6:10]
+            is_put = "P" in symbol[6:10]
 
-            price = trade.get("price", 0)
-            size = trade.get("size", 0)
-            conditions = trade.get("conditions", [])
+            price = trade.get("p", 0)
+            size = trade.get("s", 0)
+            conditions = trade.get("c", [])
 
             premium = price * size * 100  # Premium in dollars
 
             if premium < MIN_PREMIUM_SWEEP:
                 continue
 
-            # Check if sweep
-            is_sweep = any(c in SWEEP_CONDITIONS for c in conditions)
+            # Check if sweep - Alpaca uses different condition codes
+            # Sweeps are typically indicated by intermarket sweep conditions
+            is_sweep = any(c in ["I", "K", "M"] for c in conditions)  # Intermarket sweep conditions
 
             if is_call:
                 call_premium += premium
@@ -218,7 +234,7 @@ Always respond with valid JSON only, no explanations."""
                 largest_trade = {
                     "type": "CALL_SWEEP" if is_call and is_sweep else "CALL" if is_call else "PUT_SWEEP" if is_sweep else "PUT",
                     "premium": premium,
-                    "ticker": ticker,
+                    "ticker": symbol,
                     "size": size,
                     "price": price
                 }
