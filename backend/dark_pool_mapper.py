@@ -210,13 +210,13 @@ class DarkPoolMapper:
 
     def _fetch_nbbo(self, ticker: str = "SPY") -> dict:
         """Fetch current NBBO for side determination."""
-        if not HAS_REQUESTS or not self.api_key:
+        if not HAS_REQUESTS or not self.polygon_key:
             return {"bid": 0, "ask": 0}
 
         try:
             url = f"https://api.polygon.io/v3/quotes/{ticker}"
             params = {
-                "apiKey": self.api_key,
+                "apiKey": self.polygon_key,
                 "limit": 1,
                 "order": "desc"
             }
@@ -238,12 +238,12 @@ class DarkPoolMapper:
 
     def _fetch_spot_price(self, ticker: str = "SPY") -> float:
         """Fetch current spot price."""
-        if not HAS_REQUESTS or not self.api_key:
+        if not HAS_REQUESTS or not self.polygon_key:
             return 0
 
         try:
             url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev"
-            params = {"apiKey": self.api_key}
+            params = {"apiKey": self.polygon_key}
 
             resp = requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
