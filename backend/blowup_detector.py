@@ -255,72 +255,86 @@ class OptionsFlowImbalance(ComponentFetcher):
     """
     Options Flow Imbalance Detection.
     Measures put/call volume ratio and premium flow direction.
-    Extreme put buying or call buying signals directional move.
+    Uses VIX level + SPY intraday volume as proxy for options flow sentiment.
     """
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_snapshot"
         healthy = True
         direction_hint = "neutral"
 
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get SPY options aggregates
-                today = datetime.now().strftime("%Y-%m-%d")
-
-                # Simplified approach: compare put vs call volume
-                # In production, use Polygon's options flow endpoint
-                spy_data = self._get(
-                    f"https://api.polygon.io/v2/aggs/ticker/SPY/prev",
+                # Get SPY snapshot for intraday volume
+                spy_snapshot = self._get(
+                    "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY",
                     params={"apiKey": api_key}
                 )
 
-                if spy_data and spy_data.get("results"):
-                    # Use volume as proxy - high volume days often precede moves
-                    result = spy_data["results"][0]
-                    volume = result.get("v", 0)
-                    avg_volume = 80_000_000  # Typical SPY volume
+                volume = 0
+                if spy_snapshot and spy_snapshot.get("ticker"):
+                    ticker_data = spy_snapshot["ticker"]
+                    day_data = ticker_data.get("day", {})
+                    volume = day_data.get("v", 0)
 
-                    # Volume surge contributes to flow imbalance signal
-                    vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+                    # If no today's volume, use prev day
+                    if volume == 0:
+                        prev_day = ticker_data.get("prevDay", {})
+                        volume = prev_day.get("v", 0)
 
-                    # Get VIX for put/call proxy
-                    vix_data = self._get(
-                        f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                avg_volume = 80_000_000  # Typical SPY daily volume
+                vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+
+                # Get VIX for put/call sentiment proxy
+                vix_data = self._get(
+                    "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/I:VIX",
+                    params={"apiKey": api_key}
+                )
+
+                # Fallback to prev endpoint if snapshot fails for VIX
+                vix = 20
+                if vix_data and vix_data.get("ticker"):
+                    day_vix = vix_data["ticker"].get("day", {})
+                    vix = day_vix.get("c", 0) or day_vix.get("o", 20)
+                else:
+                    # Try prev endpoint as fallback
+                    vix_prev = self._get(
+                        "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
                         params={"apiKey": api_key}
                     )
+                    if vix_prev and vix_prev.get("results"):
+                        vix = vix_prev["results"][0].get("c", 20)
 
-                    vix = 20
-                    if vix_data and vix_data.get("results"):
-                        vix = vix_data["results"][0].get("c", 20)
+                details = {
+                    "spy_volume": volume,
+                    "vol_ratio": round(vol_ratio, 2),
+                    "vix": round(vix, 2)
+                }
 
-                    details = {
-                        "spy_volume": volume,
-                        "vol_ratio": vol_ratio,
-                        "vix": vix
-                    }
+                # Score: high VIX + high volume = potential blowup
+                if vix > 25 and vol_ratio > 1.5:
+                    score = min(1.0, (vix - 20) / 20 * vol_ratio / 2)
+                    direction_hint = "bearish"
+                elif vix > 30:
+                    score = min(1.0, (vix - 20) / 25)
+                    direction_hint = "bearish"
+                elif vix > 22:
+                    score = min(0.4, (vix - 18) / 20)
+                    direction_hint = "bearish"
+                elif vix < 15 and vol_ratio > 2:
+                    score = min(0.6, vol_ratio / 4)
+                    direction_hint = "bullish"
 
-                    # Score: high VIX + high volume = potential blowup
-                    if vix > 25 and vol_ratio > 1.5:
-                        score = min(1.0, (vix - 20) / 20 * vol_ratio / 2)
-                        direction_hint = "bearish"
-                    elif vix > 30:
-                        score = min(1.0, (vix - 20) / 25)
-                        direction_hint = "bearish"
-                    elif vix < 15 and vol_ratio > 2:
-                        score = min(0.6, vol_ratio / 4)
-                        direction_hint = "bullish"
-
-                    details["direction_hint"] = direction_hint
-                else:
-                    healthy = False
+                details["direction_hint"] = direction_hint
+                healthy = True
 
             except Exception as e:
                 log.debug(f"Options flow error: {e}")
                 healthy = False
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
@@ -423,56 +437,98 @@ class CryptoCascade(ComponentFetcher):
 
 class PremarketGap(ComponentFetcher):
     """
-    Premarket Gap Analysis.
-    Futures gap >0.5% at 7am = score +15 (normalized).
-    Uses Polygon or ES futures data.
+    Premarket/Intraday Gap Analysis.
+    During premarket: gap from yesterday's close to current futures/premarket price.
+    During market hours: gap from today's open to current price (intraday move).
+    Uses Polygon snapshot for real-time data.
     """
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_snapshot"
         healthy = True
 
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get SPY previous close and current price
-                spy_prev = self._get(
-                    "https://api.polygon.io/v2/aggs/ticker/SPY/prev",
-                    params={"apiKey": api_key}
-                )
-
-                # Get ES futures or SPY snapshot
+                # Get SPY snapshot for current day data
                 spy_snapshot = self._get(
-                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY",
+                    "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY",
                     params={"apiKey": api_key}
                 )
 
-                if spy_prev and spy_prev.get("results"):
-                    prev_close = spy_prev["results"][0].get("c", 0)
+                if spy_snapshot and spy_snapshot.get("ticker"):
+                    ticker_data = spy_snapshot["ticker"]
 
-                    current_price = prev_close
-                    if spy_snapshot and spy_snapshot.get("ticker"):
-                        current_price = spy_snapshot["ticker"].get("lastTrade", {}).get("p", prev_close)
+                    # Get previous day's close
+                    prev_day = ticker_data.get("prevDay", {})
+                    prev_close = prev_day.get("c", 0)
+
+                    # Get today's data
+                    day_data = ticker_data.get("day", {})
+                    today_open = day_data.get("o", 0)
+                    today_close = day_data.get("c", 0)  # Current/last price
+                    today_volume = day_data.get("v", 0)
+
+                    # Also check lastTrade for most recent price
+                    last_trade = ticker_data.get("lastTrade", {})
+                    last_price = last_trade.get("p", 0)
+
+                    # Use the most recent price available
+                    current_price = last_price if last_price > 0 else today_close
+
+                    # Determine if market is open based on volume
+                    market_open = today_volume > 0 and today_open > 0
 
                     if prev_close > 0:
-                        gap_pct = (current_price - prev_close) / prev_close
-                        details = {
-                            "prev_close": prev_close,
-                            "current_price": current_price,
-                            "gap_pct": gap_pct
-                        }
+                        if market_open and today_open > 0:
+                            # During market hours: measure gap from open + intraday move
+                            overnight_gap = (today_open - prev_close) / prev_close
+                            intraday_move = (current_price - today_open) / today_open if today_open > 0 else 0
+                            total_move = (current_price - prev_close) / prev_close
+
+                            details = {
+                                "prev_close": round(prev_close, 2),
+                                "today_open": round(today_open, 2),
+                                "current_price": round(current_price, 2),
+                                "overnight_gap_pct": round(overnight_gap * 100, 2),
+                                "intraday_move_pct": round(intraday_move * 100, 2),
+                                "total_move_pct": round(total_move * 100, 2),
+                                "market_open": True
+                            }
+
+                            # Score based on total move magnitude from prev close
+                            gap_pct = abs(total_move)
+                        else:
+                            # Premarket: use current price vs prev close
+                            gap_pct = abs((current_price - prev_close) / prev_close) if current_price > 0 else 0
+                            details = {
+                                "prev_close": round(prev_close, 2),
+                                "current_price": round(current_price, 2),
+                                "gap_pct": round(gap_pct * 100, 2),
+                                "market_open": False
+                            }
 
                         # Score based on gap magnitude
-                        if abs(gap_pct) > 0.005:  # >0.5% gap
-                            score = min(1.0, abs(gap_pct) / 0.02)  # 2% gap = max score
+                        if gap_pct > 0.02:  # >2% move
+                            score = 1.0
+                        elif gap_pct > 0.01:  # >1% move
+                            score = 0.7
+                        elif gap_pct > 0.005:  # >0.5% move
+                            score = 0.4
+                        elif gap_pct > 0.003:  # >0.3% move
+                            score = 0.2
+
+                        details["score_reason"] = f"{gap_pct*100:.2f}% move"
                 else:
                     healthy = False
+                    details["error"] = "No snapshot data"
 
             except Exception as e:
                 log.debug(f"Premarket gap error: {e}")
                 healthy = False
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
@@ -582,12 +638,13 @@ class CrossAssetDivergence(ComponentFetcher):
     Cross-Asset Divergence Detection.
     If SPY, TLT, GLD, VIX all moving same direction = +15.
     Correlated moves signal regime shift.
+    Uses snapshot endpoint for real-time intraday data.
     """
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_snapshot"
         healthy = True
 
         api_key = os.environ.get("POLYGON_API_KEY", "")
@@ -597,22 +654,30 @@ class CrossAssetDivergence(ComponentFetcher):
                 changes = {}
 
                 for ticker in tickers:
-                    data = self._get(
-                        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev",
+                    snapshot = self._get(
+                        f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
                         params={"apiKey": api_key}
                     )
 
-                    if data and data.get("results"):
-                        result = data["results"][0]
-                        open_price = result.get("o", 0)
-                        close_price = result.get("c", 0)
-                        if open_price > 0:
-                            change_pct = (close_price - open_price) / open_price
-                            changes[ticker] = change_pct
+                    if snapshot and snapshot.get("ticker"):
+                        ticker_data = snapshot["ticker"]
 
-                # Get VIX direction
+                        # Try todaysChangePerc first
+                        change_pct = ticker_data.get("todaysChangePerc", 0)
+
+                        # If not available, calculate from day data
+                        if change_pct == 0:
+                            day_data = ticker_data.get("day", {})
+                            open_price = day_data.get("o", 0)
+                            close_price = day_data.get("c", 0)
+                            if open_price > 0 and close_price > 0:
+                                change_pct = ((close_price - open_price) / open_price) * 100
+
+                        changes[ticker] = change_pct / 100  # Convert to decimal
+
+                # Get VIX direction (use prev endpoint as VIX snapshot may not work)
                 vix_data = self._get(
-                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                    "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
                     params={"apiKey": api_key}
                 )
 
@@ -623,10 +688,10 @@ class CrossAssetDivergence(ComponentFetcher):
                     if vix_open > 0:
                         changes["VIX"] = (vix_close - vix_open) / vix_open
 
-                details = {"changes": changes}
+                details = {"changes": {k: round(v * 100, 2) for k, v in changes.items()}}
 
                 if len(changes) >= 3:
-                    # Check for correlated moves
+                    # Check for correlated moves (threshold: 0.1% = 0.001)
                     directions = [1 if v > 0.001 else (-1 if v < -0.001 else 0) for v in changes.values()]
 
                     # Count how many are moving together
@@ -641,13 +706,17 @@ class CrossAssetDivergence(ComponentFetcher):
                         score = min(1.0, (max_aligned / 4) * (avg_magnitude / 0.01))
                         details["alignment"] = "risk_off" if negative > positive else "risk_on"
 
+                    details["up_count"] = positive
+                    details["down_count"] = negative
                     healthy = True
                 else:
                     healthy = False
+                    details["error"] = f"Only {len(changes)} assets reporting"
 
             except Exception as e:
                 log.debug(f"Cross-asset error: {e}")
                 healthy = False
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
@@ -668,34 +737,46 @@ class CrossAssetDivergence(ComponentFetcher):
 class VolumeSurge(ComponentFetcher):
     """
     Volume Surge Detection.
-    Current 5-min volume >3x 20-day average = +10.
+    Current day volume vs 20-day average. >3x = +10.
+    Uses snapshot endpoint for real-time intraday volume during market hours.
     """
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_snapshot"
         healthy = True
 
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get SPY recent volume
-                data = self._get(
-                    f"https://api.polygon.io/v2/aggs/ticker/SPY/prev",
+                # Use snapshot endpoint for current day's real-time data
+                snapshot = self._get(
+                    "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY",
                     params={"apiKey": api_key}
                 )
 
-                if data and data.get("results"):
-                    result = data["results"][0]
-                    volume = result.get("v", 0)
-                    avg_volume = 80_000_000  # Approximate 20-day average
+                if snapshot and snapshot.get("ticker"):
+                    ticker_data = snapshot["ticker"]
+                    day_data = ticker_data.get("day", {})
+
+                    # Get today's cumulative volume from snapshot
+                    volume = day_data.get("v", 0)
+
+                    # If volume is 0, market may be closed - try prev day
+                    if volume == 0:
+                        prev_day = ticker_data.get("prevDay", {})
+                        volume = prev_day.get("v", 0)
+                        source = "polygon_prev"
+
+                    avg_volume = 80_000_000  # Approximate 20-day average for SPY
 
                     vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
                     details = {
                         "volume": volume,
                         "avg_volume": avg_volume,
-                        "ratio": vol_ratio
+                        "ratio": round(vol_ratio, 2),
+                        "source": source
                     }
 
                     if vol_ratio > 3.0:
@@ -704,12 +785,16 @@ class VolumeSurge(ComponentFetcher):
                         score = 0.6
                     elif vol_ratio > 1.5:
                         score = 0.3
+                    elif vol_ratio > 1.0:
+                        score = 0.1  # Slightly above average
                 else:
                     healthy = False
+                    details["error"] = "No snapshot data"
 
             except Exception as e:
                 log.debug(f"Volume surge error: {e}")
                 healthy = False
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
@@ -730,56 +815,80 @@ class VolumeSurge(ComponentFetcher):
 class BreadthCollapse(ComponentFetcher):
     """
     Market Breadth Collapse Detection.
-    If >70% of S&P stocks moving same direction = +10.
-    Uses advance/decline ratio as proxy.
+    If sector ETFs moving strongly in same direction = breadth collapse signal.
+    Uses sector ETF snapshots as proxy for market breadth.
     """
+
+    # Major sector ETFs to check for breadth
+    SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE"]
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_sectors"
         healthy = True
 
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get market movers as proxy for breadth
-                gainers = self._get(
-                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers",
-                    params={"apiKey": api_key}
-                )
+                # Get snapshots for sector ETFs
+                up_count = 0
+                down_count = 0
+                changes = {}
 
-                losers = self._get(
-                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/losers",
-                    params={"apiKey": api_key}
-                )
+                for etf in self.SECTOR_ETFS:
+                    snapshot = self._get(
+                        f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{etf}",
+                        params={"apiKey": api_key}
+                    )
 
-                if gainers and losers:
-                    # Simplified breadth calculation
-                    gainer_count = len(gainers.get("tickers", []))
-                    loser_count = len(losers.get("tickers", []))
-                    total = gainer_count + loser_count
+                    if snapshot and snapshot.get("ticker"):
+                        ticker_data = snapshot["ticker"]
+                        today_change = ticker_data.get("todaysChangePerc", 0)
 
-                    if total > 0:
-                        max_side = max(gainer_count, loser_count)
-                        breadth_ratio = max_side / total
+                        # If todaysChangePerc is 0, calculate from day data
+                        if today_change == 0:
+                            day_data = ticker_data.get("day", {})
+                            open_price = day_data.get("o", 0)
+                            close_price = day_data.get("c", 0)
+                            if open_price > 0:
+                                today_change = ((close_price - open_price) / open_price) * 100
 
-                        details = {
-                            "gainers": gainer_count,
-                            "losers": loser_count,
-                            "breadth_ratio": breadth_ratio
-                        }
+                        changes[etf] = today_change
 
-                        # Score if one side dominates
-                        if breadth_ratio > 0.70:
-                            score = min(1.0, (breadth_ratio - 0.70) / 0.20)
-                            details["collapse_direction"] = "down" if loser_count > gainer_count else "up"
+                        if today_change > 0.1:  # >0.1% up
+                            up_count += 1
+                        elif today_change < -0.1:  # >0.1% down
+                            down_count += 1
+
+                total = up_count + down_count
+                if total >= 5:  # Need at least 5 sectors reporting
+                    max_side = max(up_count, down_count)
+                    breadth_ratio = max_side / len(self.SECTOR_ETFS)
+
+                    details = {
+                        "up_count": up_count,
+                        "down_count": down_count,
+                        "total_reporting": total,
+                        "breadth_ratio": round(breadth_ratio, 2),
+                        "sector_changes": {k: round(v, 2) for k, v in changes.items()}
+                    }
+
+                    # Score if one side dominates (>70% same direction)
+                    if breadth_ratio > 0.70:
+                        score = min(1.0, (breadth_ratio - 0.70) / 0.20)
+                        details["collapse_direction"] = "down" if down_count > up_count else "up"
+                    elif breadth_ratio > 0.60:
+                        score = 0.3
+                        details["collapse_direction"] = "down" if down_count > up_count else "up"
                 else:
                     healthy = False
+                    details["error"] = f"Only {total} sectors reporting"
 
             except Exception as e:
                 log.debug(f"Breadth collapse error: {e}")
                 healthy = False
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
