@@ -215,8 +215,8 @@ class ComponentFetcher:
 class VIXTermStructure(ComponentFetcher):
     """
     VIX Volatility Indicator.
-    Uses VIX level and daily change as volatility signal.
-    High VIX (>25) = elevated fear, increasing VIX = worsening sentiment.
+    Uses UVXY (VIX ETF) as proxy since VIX index requires paid tier.
+    Large UVXY moves indicate elevated volatility/fear.
     """
 
     def fetch(self) -> ComponentScore:
@@ -228,54 +228,54 @@ class VIXTermStructure(ComponentFetcher):
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get VIX data
-                vix_data = self._get(
-                    "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                # Use UVXY (1.5x VIX futures ETF) as proxy
+                uvxy_data = self._get(
+                    "https://api.polygon.io/v2/aggs/ticker/UVXY/prev",
                     params={"apiKey": api_key}
                 )
 
-                if vix_data and vix_data.get("results"):
-                    result = vix_data["results"][0]
-                    vix_open = result.get("o", 20)
-                    vix_close = result.get("c", 20)
-                    vix_high = result.get("h", 20)
+                if uvxy_data and uvxy_data.get("results"):
+                    result = uvxy_data["results"][0]
+                    uvxy_open = result.get("o", 40)
+                    uvxy_close = result.get("c", 40)
+                    uvxy_high = result.get("h", 40)
+                    uvxy_low = result.get("l", 40)
 
-                    # Calculate daily change
-                    vix_change = ((vix_close - vix_open) / vix_open) if vix_open > 0 else 0
+                    # Calculate daily change and range
+                    uvxy_change = ((uvxy_close - uvxy_open) / uvxy_open) if uvxy_open > 0 else 0
+                    uvxy_range = ((uvxy_high - uvxy_low) / uvxy_close) if uvxy_close > 0 else 0
 
                     details = {
-                        "vix_close": round(vix_close, 2),
-                        "vix_open": round(vix_open, 2),
-                        "vix_high": round(vix_high, 2),
-                        "vix_change_pct": round(vix_change * 100, 2)
+                        "uvxy_close": round(uvxy_close, 2),
+                        "uvxy_open": round(uvxy_open, 2),
+                        "uvxy_change_pct": round(uvxy_change * 100, 2),
+                        "uvxy_range_pct": round(uvxy_range * 100, 2)
                     }
 
-                    # Score based on VIX level and change
-                    # High VIX = elevated volatility/fear
-                    if vix_close > 35:
-                        score = 1.0  # Extreme fear
-                    elif vix_close > 30:
+                    # Score based on UVXY movement (proxy for VIX)
+                    # UVXY rising = VIX rising = fear
+                    if uvxy_change > 0.15:  # >15% spike
+                        score = 1.0
+                    elif uvxy_change > 0.10:  # >10% spike
                         score = 0.8
-                    elif vix_close > 25:
+                    elif uvxy_change > 0.05:  # >5% increase
                         score = 0.5
-                    elif vix_close > 22:
+                    elif uvxy_change > 0.02:  # >2% increase
                         score = 0.3
-                    elif vix_close > 20:
-                        score = 0.15
+                    elif uvxy_change < -0.05:  # Large drop = complacency, can precede moves
+                        score = 0.2
 
-                    # Boost score if VIX is rising
-                    if vix_change > 0.10:  # >10% increase
-                        score = min(1.0, score + 0.3)
-                    elif vix_change > 0.05:  # >5% increase
-                        score = min(1.0, score + 0.15)
+                    # Also consider range (high intraday volatility)
+                    if uvxy_range > 0.08:  # >8% range
+                        score = min(1.0, score + 0.2)
 
-                    details["score_reason"] = f"VIX {vix_close:.1f}, change {vix_change*100:+.1f}%"
+                    details["score_reason"] = f"UVXY {uvxy_change*100:+.1f}%, range {uvxy_range*100:.1f}%"
                 else:
                     healthy = False
-                    details["error"] = "No VIX data"
+                    details["error"] = "No UVXY data"
 
             except Exception as e:
-                log.debug(f"VIX error: {e}")
+                log.debug(f"VIX proxy error: {e}")
                 healthy = False
                 details["error"] = str(e)
         else:
@@ -299,8 +299,8 @@ class VIXTermStructure(ComponentFetcher):
 class OptionsFlowImbalance(ComponentFetcher):
     """
     Options Flow Imbalance Detection.
-    Uses VIX level + SPY volume as proxy for options flow sentiment.
-    High VIX + high volume = bearish flow pressure.
+    Uses SPY volume + price action as proxy for options flow sentiment.
+    High volume + directional move = flow imbalance.
     """
 
     def fetch(self) -> ComponentScore:
@@ -313,51 +313,51 @@ class OptionsFlowImbalance(ComponentFetcher):
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get SPY previous day volume
+                # Get SPY previous day data
                 spy_data = self._get(
                     "https://api.polygon.io/v2/aggs/ticker/SPY/prev",
                     params={"apiKey": api_key}
                 )
 
-                volume = 0
                 if spy_data and spy_data.get("results"):
-                    volume = spy_data["results"][0].get("v", 0)
+                    result = spy_data["results"][0]
+                    volume = result.get("v", 0)
+                    spy_open = result.get("o", 0)
+                    spy_close = result.get("c", 0)
+                    spy_high = result.get("h", 0)
+                    spy_low = result.get("l", 0)
 
-                avg_volume = 80_000_000  # Typical SPY daily volume
-                vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+                    avg_volume = 80_000_000  # Typical SPY daily volume
+                    vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
 
-                # Get VIX from prev endpoint
-                vix_data = self._get(
-                    "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
-                    params={"apiKey": api_key}
-                )
+                    # Calculate price action
+                    daily_change = ((spy_close - spy_open) / spy_open) if spy_open > 0 else 0
+                    daily_range = ((spy_high - spy_low) / spy_close) if spy_close > 0 else 0
 
-                vix = 20
-                if vix_data and vix_data.get("results"):
-                    vix = vix_data["results"][0].get("c", 20)
+                    details = {
+                        "spy_volume": volume,
+                        "vol_ratio": round(vol_ratio, 2),
+                        "daily_change_pct": round(daily_change * 100, 2),
+                        "daily_range_pct": round(daily_range * 100, 2)
+                    }
 
-                details = {
-                    "spy_volume": volume,
-                    "vol_ratio": round(vol_ratio, 2),
-                    "vix": round(vix, 2)
-                }
+                    # Score based on volume + directional move
+                    # High volume + strong move = flow imbalance
+                    if vol_ratio > 1.5 and abs(daily_change) > 0.01:
+                        score = min(1.0, vol_ratio / 3 * abs(daily_change) / 0.02)
+                        direction_hint = "bearish" if daily_change < 0 else "bullish"
+                    elif vol_ratio > 2.0:
+                        score = 0.4
+                        direction_hint = "bearish" if daily_change < 0 else "bullish"
+                    elif abs(daily_change) > 0.015:  # >1.5% move
+                        score = 0.3
+                        direction_hint = "bearish" if daily_change < 0 else "bullish"
 
-                # Score: high VIX + high volume = potential blowup
-                if vix > 25 and vol_ratio > 1.5:
-                    score = min(1.0, (vix - 20) / 20 * vol_ratio / 2)
-                    direction_hint = "bearish"
-                elif vix > 30:
-                    score = min(1.0, (vix - 20) / 25)
-                    direction_hint = "bearish"
-                elif vix > 22:
-                    score = min(0.4, (vix - 18) / 20)
-                    direction_hint = "bearish"
-                elif vix < 15 and vol_ratio > 2:
-                    score = min(0.6, vol_ratio / 4)
-                    direction_hint = "bullish"
-
-                details["direction_hint"] = direction_hint
-                healthy = spy_data is not None or vix_data is not None
+                    details["direction_hint"] = direction_hint
+                    healthy = True
+                else:
+                    healthy = False
+                    details["error"] = "No SPY data"
 
             except Exception as e:
                 log.debug(f"Options flow error: {e}")
