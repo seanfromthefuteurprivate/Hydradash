@@ -149,8 +149,10 @@ class PredatorIntelligenceEngine:
 
     def _is_market_hours(self) -> bool:
         """Check if within market hours (9:30 AM - 4:00 PM ET)."""
-        now = datetime.now()
-        return time(9, 30) <= now.time() <= time(16, 0)
+        import pytz
+        et = pytz.timezone('America/New_York')
+        now_et = datetime.now(et)
+        return time(9, 30) <= now_et.time() <= time(16, 0)
 
     def _gex_loop(self, event_loop: asyncio.AbstractEventLoop):
         """GEX calculation loop with adaptive interval."""
