@@ -364,13 +364,36 @@ class GEXEngine:
         except Exception as e:
             log.error(f"GEX history save error: {e}")
 
-    def _fetch_options_chain(self) -> List[dict]:
-        """Fetch SPY options chain from Polygon."""
+    def _fetch_spot_price(self) -> float:
+        """Fetch current SPY price from Polygon."""
         if not HAS_REQUESTS or not self.api_key:
-            log.warning("No requests library or API key for options chain")
-            return []
+            return 0.0
 
         try:
+            url = "https://api.polygon.io/v2/aggs/ticker/SPY/prev"
+            params = {"apiKey": self.api_key}
+
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                if results:
+                    return results[0].get("c", 0)  # Close price
+            return 0.0
+        except Exception as e:
+            log.error(f"Spot price fetch error: {e}")
+            return 0.0
+
+    def _fetch_options_chain(self) -> tuple:
+        """Fetch SPY options chain from Polygon. Returns (options_list, spot_price)."""
+        if not HAS_REQUESTS or not self.api_key:
+            log.warning("No requests library or API key for options chain")
+            return [], 0.0
+
+        try:
+            # Get spot price first
+            spot_price = self._fetch_spot_price()
+
             # Get 0DTE options
             today = datetime.now().strftime("%Y-%m-%d")
 
@@ -401,11 +424,11 @@ class GEXEngine:
             else:
                 log.warning(f"Options chain fetch failed: {resp.status_code}")
 
-            return all_results
+            return all_results, spot_price
 
         except Exception as e:
             log.error(f"Options chain fetch error: {e}")
-            return []
+            return [], 0.0
 
     def _parse_option(self, raw: dict) -> dict:
         """Parse Polygon option snapshot into usable format."""
@@ -433,10 +456,10 @@ class GEXEngine:
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        # Fetch and parse options chain
-        raw_options = self._fetch_options_chain()
+        # Fetch options chain and spot price
+        raw_options, spot_price = self._fetch_options_chain()
 
-        if not raw_options:
+        if not raw_options or spot_price <= 0:
             # Return empty snapshot if no data
             log.warning("No options data available for GEX calculation")
             return GEXSnapshot(
@@ -458,14 +481,6 @@ class GEXEngine:
             )
 
         options = [self._parse_option(o) for o in raw_options]
-        spot_price = options[0]["underlying_price"] if options else 0
-
-        if spot_price <= 0:
-            # Try to get spot from first valid option
-            for opt in options:
-                if opt["underlying_price"] > 0:
-                    spot_price = opt["underlying_price"]
-                    break
 
         # Calculate GEX for each strike
         total_gex = 0
