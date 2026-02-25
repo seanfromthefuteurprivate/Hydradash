@@ -133,6 +133,49 @@ class BlowupResult:
 #  Each returns a normalized 0-1 score with fallback to 0 on error
 # ═══════════════════════════════════════════════════════════════
 
+# Global response cache to reduce API calls (rate limit: 5/min on free tier)
+_response_cache: Dict[str, tuple] = {}  # {url: (timestamp, data)}
+CACHE_TTL = 60  # Cache responses for 60 seconds
+
+
+def _get_cached(url: str, params: dict = None, headers: dict = None, timeout: int = 10) -> Optional[dict]:
+    """HTTP GET with caching to reduce API calls and avoid rate limits."""
+    if not HAS_REQUESTS:
+        return None
+
+    # Build cache key from URL and params
+    cache_key = url + (json.dumps(params, sort_keys=True) if params else "")
+    now = time.time()
+
+    # Check cache
+    if cache_key in _response_cache:
+        cached_time, cached_data = _response_cache[cache_key]
+        if now - cached_time < CACHE_TTL:
+            return cached_data
+
+    # Make request
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            _response_cache[cache_key] = (now, data)
+            return data
+        elif resp.status_code == 429:
+            log.warning(f"Rate limited: {url}")
+            # Return cached data if available, even if stale
+            if cache_key in _response_cache:
+                return _response_cache[cache_key][1]
+        else:
+            log.debug(f"HTTP {resp.status_code}: {url}")
+        return None
+    except Exception as e:
+        log.debug(f"Request error: {e}")
+        # Return cached data if available
+        if cache_key in _response_cache:
+            return _response_cache[cache_key][1]
+        return None
+
+
 class ComponentFetcher:
     """Base class for component data fetching with timeout and fallback."""
 
@@ -144,22 +187,13 @@ class ComponentFetcher:
         self.error_count = 0
 
     def _get(self, url: str, params: dict = None, headers: dict = None) -> Optional[dict]:
-        """HTTP GET with timeout and graceful fallback."""
-        if not HAS_REQUESTS:
-            return None
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
-            if resp.status_code == 200:
-                self.error_count = 0
-                return resp.json()
-            else:
-                log.debug(f"{self.__class__.__name__}: HTTP {resp.status_code}")
-                self.error_count += 1
-                return None
-        except Exception as e:
-            log.debug(f"{self.__class__.__name__}: {e}")
+        """HTTP GET with caching and graceful fallback."""
+        data = _get_cached(url, params, headers, self.TIMEOUT)
+        if data:
+            self.error_count = 0
+        else:
             self.error_count += 1
-            return None
+        return data
 
     def _get_text(self, url: str) -> Optional[str]:
         """HTTP GET text with timeout."""
