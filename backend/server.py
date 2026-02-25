@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 
 from dotenv import load_dotenv
+# Data directory path
+DATA_DIR = Path(__file__).parent.parent / "data"
 # Load .env from project root (parent of backend/) when running locally
 _load_env = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_load_env)
@@ -29,6 +31,9 @@ from fastapi.responses import FileResponse
 from hydra_signal_detection import SignalOrchestrator, export_dashboard_data, DATA_SOURCE_REGISTRY
 from hydra_telegram import TelegramBridge, SignalParser, EventScheduler
 from hydra_engine import HydraOrchestrator
+from blowup_detector import get_blowup_detector, BlowupResult
+from event_surprise import get_event_calendar, get_surprise_detector
+from weight_calibrator import get_weight_calibrator, TradeResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("HYDRA.API")
@@ -41,6 +46,11 @@ telegram = TelegramBridge(
 )
 trading_engine = None  # Initialized if Alpaca keys present
 ws_clients: list[WebSocket] = []
+
+# Blowup detection engine
+blowup_detector = get_blowup_detector()
+event_calendar = get_event_calendar()
+weight_calibrator = get_weight_calibrator()
 
 
 async def broadcast_to_clients(data: str):
@@ -111,6 +121,38 @@ def telegram_poll_loop():
         time.sleep(10)
 
 
+def blowup_detection_loop(loop: asyncio.AbstractEventLoop):
+    """Run the blowup probability engine every 60 seconds."""
+    while True:
+        try:
+            result = blowup_detector.calculate()
+            log.info(f"Blowup score: {result.blowup_probability} | Direction: {result.direction} | Rec: {result.recommendation}")
+
+            # Broadcast to WebSocket clients
+            data = json.dumps({
+                "type": "blowup_update",
+                "blowup": result.to_dict()
+            }, default=str)
+            asyncio.run_coroutine_threadsafe(broadcast_to_clients(data), loop)
+
+            # Alert on high blowup scores
+            if result.blowup_probability >= 70 and telegram.connected:
+                try:
+                    telegram.send_message(
+                        f"🚨 BLOWUP ALERT: {result.blowup_probability}%\n"
+                        f"Direction: {result.direction}\n"
+                        f"Regime: {result.regime}\n"
+                        f"Recommendation: {result.recommendation}\n"
+                        f"Triggers: {', '.join(result.triggers[:3])}"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.error(f"Blowup detection error: {e}")
+        time.sleep(60)  # Run every 60 seconds
+
+
 # ── App Lifecycle ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -122,6 +164,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=signal_scan_loop, args=(loop,), daemon=True, name="signal-scanner"),
         threading.Thread(target=trading_loop, daemon=True, name="trading-engine"),
         threading.Thread(target=telegram_poll_loop, daemon=True, name="telegram-poller"),
+        threading.Thread(target=blowup_detection_loop, args=(loop,), daemon=True, name="blowup-detector"),
     ]
     for t in threads:
         t.start()
@@ -221,6 +264,209 @@ def trigger_scan():
     """Manually trigger a full signal scan."""
     new = signal_orch.scan_all()
     return {"new_signals": len(new), "total_active": len(signal_orch.all_signals)}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PREDICTIVE INTELLIGENCE ENGINE ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/blowup")
+def get_blowup():
+    """
+    Get current blowup probability score.
+    This is the core predictive intelligence output.
+    """
+    result = blowup_detector.get_last_result()
+    if result:
+        return result.to_dict()
+
+    # If no result yet, calculate one
+    result = blowup_detector.calculate()
+    return result.to_dict()
+
+
+@app.get("/api/blowup/history")
+def get_blowup_history(count: int = 10):
+    """Get recent blowup scores for trend display."""
+    return {
+        "scores": blowup_detector.get_recent_scores(count),
+        "count": count
+    }
+
+
+@app.get("/api/events")
+def get_events(hours: int = 72):
+    """
+    Get upcoming economic events with time-to-event and expected impact.
+    """
+    return {
+        "events": event_calendar.get_events_for_api(hours),
+        "count": len(event_calendar.get_events_for_api(hours))
+    }
+
+
+@app.get("/api/intelligence")
+def get_intelligence():
+    """
+    MASTER ENDPOINT: Returns ALL intelligence data in one call.
+    This is the single source of truth that WSB Snake polls every 60 seconds.
+    Must be fast (<200ms) and never crash (returns safe defaults if data source down).
+    """
+    try:
+        # Get blowup result (cached from last calculation)
+        blowup_result = blowup_detector.get_last_result()
+        if not blowup_result:
+            blowup_result = blowup_detector.calculate()
+
+        # Get upcoming events
+        events = event_calendar.get_events_for_api(hours=24)
+        events_next_30min = [e for e in events if -30 <= e.get("minutes_until", 999) <= 30]
+
+        # Get recent blowup scores for trend
+        recent_scores = blowup_detector.get_recent_scores(10)
+
+        # Get signal summary
+        signal_summary = signal_orch.get_summary()
+
+        # Get trading status
+        trading_status = None
+        if trading_engine:
+            rm = trading_engine.risk_mgr
+            trading_status = {
+                "status": "active",
+                "capital": rm.capital,
+                "daily_pnl": rm.daily_pnl,
+                "trades_today": rm.daily_trade_count
+            }
+
+        return {
+            # Core blowup intelligence
+            "blowup_probability": blowup_result.blowup_probability,
+            "direction": blowup_result.direction,
+            "regime": blowup_result.regime,
+            "confidence": blowup_result.confidence,
+            "triggers": blowup_result.triggers,
+            "recommendation": blowup_result.recommendation,
+
+            # Events
+            "events_next_30min": events_next_30min,
+            "upcoming_events": events[:5],
+
+            # Trends
+            "recent_scores": recent_scores,
+
+            # Signal summary
+            "signals_active": signal_summary.get("total_active", 0),
+            "signals_critical": signal_summary.get("critical", 0),
+
+            # Trading status
+            "trading": trading_status,
+
+            # System status
+            "timestamp": blowup_result.timestamp,
+            "engine": "HYDRA v2.0 - Predictive Intelligence",
+            "components_healthy": sum(1 for c in blowup_result.components if c.get("healthy", False)),
+            "components_total": len(blowup_result.components)
+        }
+
+    except Exception as e:
+        log.error(f"Intelligence endpoint error: {e}")
+        # Return safe defaults - never crash
+        return {
+            "blowup_probability": 0,
+            "direction": "NEUTRAL",
+            "regime": "UNKNOWN",
+            "confidence": 0.0,
+            "triggers": [],
+            "recommendation": "NO_TRADE",
+            "events_next_30min": [],
+            "upcoming_events": [],
+            "recent_scores": [],
+            "signals_active": 0,
+            "signals_critical": 0,
+            "trading": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "engine": "HYDRA v2.0 - ERROR STATE",
+            "error": str(e)
+        }
+
+
+@app.post("/api/trade-result")
+def record_trade_result(data: dict):
+    """
+    Receive trade result from WSB Snake for weight calibration.
+
+    Expected payload:
+    {
+        "trade_id": "...",
+        "ticker": "SPY",
+        "direction": "CALL",
+        "mode": "BLOWUP",
+        "entry_time": "2026-02-25T15:03:00",
+        "exit_time": "2026-02-25T15:18:00",
+        "pnl_percent": 47.3,
+        "conviction": 78,
+        "blowup_score_at_entry": 72,
+        "blowup_direction_at_entry": "BULLISH",
+        "triggers_at_entry": ["vix_inverted", "volume_surge"],
+        "regime_at_entry": "RISK_ON"
+    }
+    """
+    try:
+        trade = TradeResult.from_dict(data)
+        success = weight_calibrator.record_trade(trade)
+
+        return {
+            "status": "ok" if success else "error",
+            "trade_id": trade.trade_id,
+            "recorded": success
+        }
+
+    except Exception as e:
+        log.error(f"Trade result error: {e}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@app.get("/api/calibration/stats")
+def get_calibration_stats(days: int = 30):
+    """Get trade statistics for calibration."""
+    return weight_calibrator.get_trade_stats(days)
+
+
+@app.get("/api/calibration/weights")
+def get_current_weights():
+    """Get current blowup detector weights."""
+    return {
+        "weights": weight_calibrator.current_weights,
+        "source": "calibrated" if (DATA_DIR / "blowup_weights.json").exists() else "default"
+    }
+
+
+@app.post("/api/calibration/run")
+def run_calibration():
+    """Manually trigger weight calibration (normally runs daily at 4:30 PM ET)."""
+    result = weight_calibrator.calibrate()
+    if result:
+        # Hot reload weights in blowup detector
+        blowup_detector.reload_weights()
+        return {
+            "status": "ok",
+            "calibration": {
+                "total_trades": result.total_trades,
+                "win_rate": result.win_rate,
+                "precision": result.precision,
+                "recall": result.recall,
+                "new_weights": result.new_weights,
+                "notes": result.notes
+            }
+        }
+    return {
+        "status": "skipped",
+        "reason": "Not enough trades for calibration"
+    }
 
 
 # ── WebSocket for real-time updates ──

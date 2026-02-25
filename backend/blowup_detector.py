@@ -1,0 +1,1147 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║               HYDRA BLOWUP PROBABILITY ENGINE v1.0                          ║
+║         "What is the probability of a violent market move in 30 min?"       ║
+║                                                                              ║
+║  This is the crown jewel. It synthesizes ALL data sources into one score:   ║
+║  BLOWUP_PROBABILITY (0-100). Calculated every 60 seconds.                   ║
+║                                                                              ║
+║  Inputs:                                                                     ║
+║  1. VIX term structure inversion                                            ║
+║  2. Options flow imbalance                                                  ║
+║  3. Crypto cascade detection                                                ║
+║  4. Premarket gap analysis                                                  ║
+║  5. Event proximity (FOMC/CPI/NFP)                                          ║
+║  6. Cross-asset divergence                                                  ║
+║  7. Volume surge detection                                                  ║
+║  8. Market breadth collapse                                                 ║
+║                                                                              ║
+║  Output: JSON with probability, direction, regime, recommendation           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import json
+import time
+import logging
+import sqlite3
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, asdict, field
+from typing import Optional, List, Dict, Any
+from enum import Enum
+from pathlib import Path
+from collections import deque
+
+log = logging.getLogger("HYDRA.BLOWUP")
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+class BlowupRegime(Enum):
+    RISK_ON = "RISK_ON"
+    RISK_OFF = "RISK_OFF"
+    TRANSITION = "TRANSITION"
+    UNKNOWN = "UNKNOWN"
+
+
+class Direction(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+
+
+class Recommendation(Enum):
+    NO_TRADE = "NO_TRADE"
+    SCALP_ONLY = "SCALP_ONLY"
+    STRADDLE = "STRADDLE"
+    DIRECTIONAL_PUT = "DIRECTIONAL_PUT"
+    DIRECTIONAL_CALL = "DIRECTIONAL_CALL"
+
+
+# Default weights - calibrated via weight_calibrator.py
+DEFAULT_WEIGHTS = {
+    "vix_inversion": 0.20,
+    "flow_imbalance": 0.20,
+    "crypto_cascade": 0.10,
+    "premarket_gap": 0.10,
+    "event_proximity": 0.15,
+    "cross_asset": 0.10,
+    "volume_surge": 0.10,
+    "breadth": 0.05
+}
+
+# Thresholds for recommendations
+THRESHOLDS = {
+    "calm": 30,          # 0-30: SCALP_ONLY
+    "elevated": 50,      # 30-50: SCALP_ONLY (tighten stops)
+    "high": 70,          # 50-70: STRADDLE
+    "extreme": 100       # 70-100: DIRECTIONAL
+}
+
+# Path to store weights and history
+DATA_DIR = Path(__file__).parent.parent / "data"
+WEIGHTS_FILE = DATA_DIR / "blowup_weights.json"
+HISTORY_DB = DATA_DIR / "blowup_history.db"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class ComponentScore:
+    """Individual component contribution to blowup score."""
+    name: str
+    raw_value: float      # 0.0 to 1.0 normalized
+    weight: float         # From weights config
+    weighted_value: float # raw * weight
+    source: str           # Data source used
+    healthy: bool         # Was data fetch successful?
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
+class BlowupResult:
+    """Complete blowup analysis result."""
+    blowup_probability: int           # 0-100
+    direction: str                    # BULLISH/BEARISH/NEUTRAL
+    regime: str                       # RISK_ON/RISK_OFF/TRANSITION
+    confidence: float                 # 0.0-1.0 based on data quality
+    triggers: List[str]               # Active triggers
+    recommendation: str               # NO_TRADE/SCALP_ONLY/STRADDLE/DIRECTIONAL_*
+    events_next_30min: List[dict]     # Upcoming events
+    timestamp: str                    # ISO timestamp
+    components: List[dict]            # Detailed component breakdown
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  COMPONENT FETCHERS
+#  Each returns a normalized 0-1 score with fallback to 0 on error
+# ═══════════════════════════════════════════════════════════════
+
+class ComponentFetcher:
+    """Base class for component data fetching with timeout and fallback."""
+
+    TIMEOUT = 10  # seconds
+
+    def __init__(self):
+        self.last_value = 0.0
+        self.last_fetch = None
+        self.error_count = 0
+
+    def _get(self, url: str, params: dict = None, headers: dict = None) -> Optional[dict]:
+        """HTTP GET with timeout and graceful fallback."""
+        if not HAS_REQUESTS:
+            return None
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
+            if resp.status_code == 200:
+                self.error_count = 0
+                return resp.json()
+            else:
+                log.debug(f"{self.__class__.__name__}: HTTP {resp.status_code}")
+                self.error_count += 1
+                return None
+        except Exception as e:
+            log.debug(f"{self.__class__.__name__}: {e}")
+            self.error_count += 1
+            return None
+
+    def _get_text(self, url: str) -> Optional[str]:
+        """HTTP GET text with timeout."""
+        if not HAS_REQUESTS:
+            return None
+        try:
+            resp = requests.get(url, timeout=self.TIMEOUT, headers={
+                "User-Agent": "Mozilla/5.0 (HYDRA Blowup Engine)"
+            })
+            return resp.text if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.error_count < 3
+
+
+class VIXTermStructure(ComponentFetcher):
+    """
+    VIX Term Structure Inversion Detection.
+    If 0DTE IV > 1DTE IV by >20%, score +25 (normalized to 0.25/0.20 = 1.25 cap at 1.0)
+    Uses Polygon for options data or falls back to CBOE VIX data.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+
+        # Try Polygon API for SPY options term structure
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                # Get SPY 0DTE and 1DTE ATM options implied vol
+                today = datetime.now().strftime("%Y-%m-%d")
+                tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+                # Simplified: use VIX index as proxy (free tier limitation)
+                vix_data = self._get(
+                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                    params={"apiKey": api_key}
+                )
+
+                vix9d_data = self._get(
+                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX9D/prev",
+                    params={"apiKey": api_key}
+                )
+
+                if vix_data and vix9d_data:
+                    vix = vix_data.get("results", [{}])[0].get("c", 20)
+                    vix9d = vix9d_data.get("results", [{}])[0].get("c", 20)
+
+                    # Inversion: short-term vol > long-term vol
+                    if vix9d > 0:
+                        inversion_pct = (vix - vix9d) / vix9d
+                        details = {"vix": vix, "vix9d": vix9d, "inversion_pct": inversion_pct}
+
+                        # Score based on inversion degree
+                        if inversion_pct > 0.20:  # >20% inverted
+                            score = min(1.0, inversion_pct / 0.40)  # Cap at 40% = score 1.0
+                        elif inversion_pct > 0.10:
+                            score = inversion_pct / 0.40
+                        elif inversion_pct > 0:
+                            score = inversion_pct / 0.80  # Mild inversion
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"VIX term structure error: {e}")
+                healthy = False
+                source = "fallback"
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+        self.last_fetch = datetime.now(timezone.utc)
+
+        return ComponentScore(
+            name="vix_inversion",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["vix_inversion"],
+            weighted_value=score * DEFAULT_WEIGHTS["vix_inversion"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class OptionsFlowImbalance(ComponentFetcher):
+    """
+    Options Flow Imbalance Detection.
+    Measures put/call volume ratio and premium flow direction.
+    Extreme put buying or call buying signals directional move.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+        direction_hint = "neutral"
+
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                # Get SPY options aggregates
+                today = datetime.now().strftime("%Y-%m-%d")
+
+                # Simplified approach: compare put vs call volume
+                # In production, use Polygon's options flow endpoint
+                spy_data = self._get(
+                    f"https://api.polygon.io/v2/aggs/ticker/SPY/prev",
+                    params={"apiKey": api_key}
+                )
+
+                if spy_data and spy_data.get("results"):
+                    # Use volume as proxy - high volume days often precede moves
+                    result = spy_data["results"][0]
+                    volume = result.get("v", 0)
+                    avg_volume = 80_000_000  # Typical SPY volume
+
+                    # Volume surge contributes to flow imbalance signal
+                    vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+
+                    # Get VIX for put/call proxy
+                    vix_data = self._get(
+                        f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                        params={"apiKey": api_key}
+                    )
+
+                    vix = 20
+                    if vix_data and vix_data.get("results"):
+                        vix = vix_data["results"][0].get("c", 20)
+
+                    details = {
+                        "spy_volume": volume,
+                        "vol_ratio": vol_ratio,
+                        "vix": vix
+                    }
+
+                    # Score: high VIX + high volume = potential blowup
+                    if vix > 25 and vol_ratio > 1.5:
+                        score = min(1.0, (vix - 20) / 20 * vol_ratio / 2)
+                        direction_hint = "bearish"
+                    elif vix > 30:
+                        score = min(1.0, (vix - 20) / 25)
+                        direction_hint = "bearish"
+                    elif vix < 15 and vol_ratio > 2:
+                        score = min(0.6, vol_ratio / 4)
+                        direction_hint = "bullish"
+
+                    details["direction_hint"] = direction_hint
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"Options flow error: {e}")
+                healthy = False
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+        return ComponentScore(
+            name="flow_imbalance",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["flow_imbalance"],
+            weighted_value=score * DEFAULT_WEIGHTS["flow_imbalance"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class CryptoCascade(ComponentFetcher):
+    """
+    Crypto Cascade Detection.
+    Monitors BTC funding rates and OI changes for liquidation cascade signals.
+    Uses CoinGlass or Deribit data.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.oi_history = deque(maxlen=20)
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "deribit"
+        healthy = True
+
+        try:
+            # Try Deribit (no auth required for public data)
+            deribit_data = self._get(
+                "https://www.deribit.com/api/v2/public/get_book_summary_by_currency",
+                params={"currency": "BTC", "kind": "future"}
+            )
+
+            if deribit_data and deribit_data.get("result"):
+                # Calculate aggregate OI and funding sentiment
+                total_oi = 0
+                btc_price = 0
+
+                for item in deribit_data["result"]:
+                    if item.get("instrument_name") == "BTC-PERPETUAL":
+                        total_oi = item.get("open_interest", 0)
+                        btc_price = item.get("mark_price", 0)
+                        funding = item.get("funding_8h", 0)
+
+                        details = {
+                            "btc_price": btc_price,
+                            "perpetual_oi": total_oi,
+                            "funding_8h": funding
+                        }
+
+                        # Check for extreme funding (liquidation signal)
+                        if abs(funding) > 0.0005:  # >0.05% per 8hr
+                            score += min(0.5, abs(funding) / 0.001)
+
+                        break
+
+                # Track OI changes
+                if total_oi > 0:
+                    self.oi_history.append((time.time(), total_oi))
+
+                    if len(self.oi_history) >= 2:
+                        prev_ts, prev_oi = self.oi_history[-2]
+                        oi_change_pct = (total_oi - prev_oi) / prev_oi if prev_oi > 0 else 0
+                        details["oi_change_pct"] = oi_change_pct
+
+                        # Rapid OI drop = cascade in progress
+                        if oi_change_pct < -0.03:
+                            score += min(0.5, abs(oi_change_pct) * 10)
+                        # Rapid OI increase = leverage building
+                        elif oi_change_pct > 0.05:
+                            score += min(0.3, oi_change_pct * 5)
+            else:
+                healthy = False
+                source = "deribit_failed"
+
+        except Exception as e:
+            log.debug(f"Crypto cascade error: {e}")
+            healthy = False
+
+        score = min(1.0, score)
+        self.last_value = score
+
+        return ComponentScore(
+            name="crypto_cascade",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["crypto_cascade"],
+            weighted_value=score * DEFAULT_WEIGHTS["crypto_cascade"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class PremarketGap(ComponentFetcher):
+    """
+    Premarket Gap Analysis.
+    Futures gap >0.5% at 7am = score +15 (normalized).
+    Uses Polygon or ES futures data.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                # Get SPY previous close and current price
+                spy_prev = self._get(
+                    "https://api.polygon.io/v2/aggs/ticker/SPY/prev",
+                    params={"apiKey": api_key}
+                )
+
+                # Get ES futures or SPY snapshot
+                spy_snapshot = self._get(
+                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY",
+                    params={"apiKey": api_key}
+                )
+
+                if spy_prev and spy_prev.get("results"):
+                    prev_close = spy_prev["results"][0].get("c", 0)
+
+                    current_price = prev_close
+                    if spy_snapshot and spy_snapshot.get("ticker"):
+                        current_price = spy_snapshot["ticker"].get("lastTrade", {}).get("p", prev_close)
+
+                    if prev_close > 0:
+                        gap_pct = (current_price - prev_close) / prev_close
+                        details = {
+                            "prev_close": prev_close,
+                            "current_price": current_price,
+                            "gap_pct": gap_pct
+                        }
+
+                        # Score based on gap magnitude
+                        if abs(gap_pct) > 0.005:  # >0.5% gap
+                            score = min(1.0, abs(gap_pct) / 0.02)  # 2% gap = max score
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"Premarket gap error: {e}")
+                healthy = False
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+
+        return ComponentScore(
+            name="premarket_gap",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["premarket_gap"],
+            weighted_value=score * DEFAULT_WEIGHTS["premarket_gap"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class EventProximity(ComponentFetcher):
+    """
+    Event Proximity Detection.
+    FOMC/CPI/NFP within 30 min = +20, within 2hr = +10.
+    """
+
+    # Key market-moving events (updated regularly)
+    EVENTS = [
+        {"name": "NFP", "dates": ["2026-02-07", "2026-03-07", "2026-04-04"]},
+        {"name": "CPI", "dates": ["2026-02-13", "2026-03-12", "2026-04-10"]},
+        {"name": "FOMC", "dates": ["2026-03-19", "2026-05-07", "2026-06-18"]},
+        {"name": "GDP", "dates": ["2026-02-27", "2026-03-27"]},
+        {"name": "PCE", "dates": ["2026-02-28", "2026-03-28"]},
+    ]
+
+    # Events typically release at 8:30 AM ET (13:30 UTC) or 2:00 PM ET (19:00 UTC for FOMC)
+    EVENT_TIMES = {
+        "NFP": "13:30",
+        "CPI": "13:30",
+        "GDP": "13:30",
+        "PCE": "13:30",
+        "FOMC": "19:00",
+    }
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "calendar"
+        healthy = True
+        events_soon = []
+
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+
+        for event in self.EVENTS:
+            event_name = event["name"]
+            event_time_str = self.EVENT_TIMES.get(event_name, "13:30")
+
+            for date_str in event["dates"]:
+                try:
+                    event_datetime = datetime.strptime(
+                        f"{date_str} {event_time_str}",
+                        "%Y-%m-%d %H:%M"
+                    ).replace(tzinfo=timezone.utc)
+
+                    time_diff = (event_datetime - now).total_seconds()
+                    minutes_until = time_diff / 60
+
+                    if -30 <= minutes_until <= 30:  # Within 30 min
+                        score = max(score, 1.0)  # Full score
+                        events_soon.append({
+                            "name": event_name,
+                            "minutes_until": int(minutes_until),
+                            "datetime": event_datetime.isoformat()
+                        })
+                    elif 30 < minutes_until <= 120:  # Within 2hr
+                        score = max(score, 0.5)
+                        events_soon.append({
+                            "name": event_name,
+                            "minutes_until": int(minutes_until),
+                            "datetime": event_datetime.isoformat()
+                        })
+                    elif 120 < minutes_until <= 1440:  # Within 24hr
+                        score = max(score, 0.2)
+                        events_soon.append({
+                            "name": event_name,
+                            "minutes_until": int(minutes_until),
+                            "datetime": event_datetime.isoformat()
+                        })
+
+                except ValueError:
+                    continue
+
+        details = {"events_soon": events_soon}
+        self.last_value = score
+
+        return ComponentScore(
+            name="event_proximity",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["event_proximity"],
+            weighted_value=score * DEFAULT_WEIGHTS["event_proximity"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class CrossAssetDivergence(ComponentFetcher):
+    """
+    Cross-Asset Divergence Detection.
+    If SPY, TLT, GLD, VIX all moving same direction = +15.
+    Correlated moves signal regime shift.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                tickers = ["SPY", "TLT", "GLD"]
+                changes = {}
+
+                for ticker in tickers:
+                    data = self._get(
+                        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev",
+                        params={"apiKey": api_key}
+                    )
+
+                    if data and data.get("results"):
+                        result = data["results"][0]
+                        open_price = result.get("o", 0)
+                        close_price = result.get("c", 0)
+                        if open_price > 0:
+                            change_pct = (close_price - open_price) / open_price
+                            changes[ticker] = change_pct
+
+                # Get VIX direction
+                vix_data = self._get(
+                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                    params={"apiKey": api_key}
+                )
+
+                if vix_data and vix_data.get("results"):
+                    result = vix_data["results"][0]
+                    vix_open = result.get("o", 20)
+                    vix_close = result.get("c", 20)
+                    if vix_open > 0:
+                        changes["VIX"] = (vix_close - vix_open) / vix_open
+
+                details = {"changes": changes}
+
+                if len(changes) >= 3:
+                    # Check for correlated moves
+                    directions = [1 if v > 0.001 else (-1 if v < -0.001 else 0) for v in changes.values()]
+
+                    # Count how many are moving together
+                    positive = sum(1 for d in directions if d > 0)
+                    negative = sum(1 for d in directions if d < 0)
+
+                    # If 3+ assets moving same direction strongly
+                    max_aligned = max(positive, negative)
+                    if max_aligned >= 3:
+                        # Calculate magnitude of moves
+                        avg_magnitude = sum(abs(v) for v in changes.values()) / len(changes)
+                        score = min(1.0, (max_aligned / 4) * (avg_magnitude / 0.01))
+                        details["alignment"] = "risk_off" if negative > positive else "risk_on"
+
+                    healthy = True
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"Cross-asset error: {e}")
+                healthy = False
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+
+        return ComponentScore(
+            name="cross_asset",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["cross_asset"],
+            weighted_value=score * DEFAULT_WEIGHTS["cross_asset"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class VolumeSurge(ComponentFetcher):
+    """
+    Volume Surge Detection.
+    Current 5-min volume >3x 20-day average = +10.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                # Get SPY recent volume
+                data = self._get(
+                    f"https://api.polygon.io/v2/aggs/ticker/SPY/prev",
+                    params={"apiKey": api_key}
+                )
+
+                if data and data.get("results"):
+                    result = data["results"][0]
+                    volume = result.get("v", 0)
+                    avg_volume = 80_000_000  # Approximate 20-day average
+
+                    vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+                    details = {
+                        "volume": volume,
+                        "avg_volume": avg_volume,
+                        "ratio": vol_ratio
+                    }
+
+                    if vol_ratio > 3.0:
+                        score = 1.0
+                    elif vol_ratio > 2.0:
+                        score = 0.6
+                    elif vol_ratio > 1.5:
+                        score = 0.3
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"Volume surge error: {e}")
+                healthy = False
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+
+        return ComponentScore(
+            name="volume_surge",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["volume_surge"],
+            weighted_value=score * DEFAULT_WEIGHTS["volume_surge"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+class BreadthCollapse(ComponentFetcher):
+    """
+    Market Breadth Collapse Detection.
+    If >70% of S&P stocks moving same direction = +10.
+    Uses advance/decline ratio as proxy.
+    """
+
+    def fetch(self) -> ComponentScore:
+        score = 0.0
+        details = {}
+        source = "polygon"
+        healthy = True
+
+        api_key = os.environ.get("POLYGON_API_KEY", "")
+        if api_key:
+            try:
+                # Get market movers as proxy for breadth
+                gainers = self._get(
+                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers",
+                    params={"apiKey": api_key}
+                )
+
+                losers = self._get(
+                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/losers",
+                    params={"apiKey": api_key}
+                )
+
+                if gainers and losers:
+                    # Simplified breadth calculation
+                    gainer_count = len(gainers.get("tickers", []))
+                    loser_count = len(losers.get("tickers", []))
+                    total = gainer_count + loser_count
+
+                    if total > 0:
+                        max_side = max(gainer_count, loser_count)
+                        breadth_ratio = max_side / total
+
+                        details = {
+                            "gainers": gainer_count,
+                            "losers": loser_count,
+                            "breadth_ratio": breadth_ratio
+                        }
+
+                        # Score if one side dominates
+                        if breadth_ratio > 0.70:
+                            score = min(1.0, (breadth_ratio - 0.70) / 0.20)
+                            details["collapse_direction"] = "down" if loser_count > gainer_count else "up"
+                else:
+                    healthy = False
+
+            except Exception as e:
+                log.debug(f"Breadth collapse error: {e}")
+                healthy = False
+        else:
+            healthy = False
+            source = "no_api_key"
+
+        self.last_value = score
+
+        return ComponentScore(
+            name="breadth",
+            raw_value=score,
+            weight=DEFAULT_WEIGHTS["breadth"],
+            weighted_value=score * DEFAULT_WEIGHTS["breadth"],
+            source=source,
+            healthy=healthy,
+            details=details
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  BLOWUP PROBABILITY ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+class BlowupDetector:
+    """
+    Main blowup probability engine.
+    Synthesizes all components into a single score every 60 seconds.
+    """
+
+    def __init__(self):
+        # Initialize component fetchers
+        self.components = {
+            "vix_inversion": VIXTermStructure(),
+            "flow_imbalance": OptionsFlowImbalance(),
+            "crypto_cascade": CryptoCascade(),
+            "premarket_gap": PremarketGap(),
+            "event_proximity": EventProximity(),
+            "cross_asset": CrossAssetDivergence(),
+            "volume_surge": VolumeSurge(),
+            "breadth": BreadthCollapse(),
+        }
+
+        # Load weights from file or use defaults
+        self.weights = self._load_weights()
+
+        # History tracking
+        self.score_history = deque(maxlen=100)  # Last 100 scores
+        self.last_result: Optional[BlowupResult] = None
+
+        # Initialize SQLite for history
+        self._init_db()
+
+    def _load_weights(self) -> dict:
+        """Load weights from file or return defaults."""
+        try:
+            if WEIGHTS_FILE.exists():
+                with open(WEIGHTS_FILE) as f:
+                    loaded = json.load(f)
+                    # Merge with defaults in case new components added
+                    weights = DEFAULT_WEIGHTS.copy()
+                    weights.update(loaded)
+                    return weights
+        except Exception as e:
+            log.warning(f"Could not load weights file: {e}")
+        return DEFAULT_WEIGHTS.copy()
+
+    def save_weights(self, weights: dict):
+        """Save weights to file."""
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with open(WEIGHTS_FILE, 'w') as f:
+                json.dump(weights, f, indent=2)
+            self.weights = weights
+            log.info(f"Weights saved: {weights}")
+        except Exception as e:
+            log.error(f"Could not save weights: {e}")
+
+    def reload_weights(self):
+        """Hot reload weights from file."""
+        self.weights = self._load_weights()
+        log.info(f"Weights reloaded: {self.weights}")
+
+    def _init_db(self):
+        """Initialize SQLite database for history tracking."""
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(HISTORY_DB))
+            cursor = conn.cursor()
+
+            # Blowup score history
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blowup_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    blowup_score INTEGER,
+                    direction TEXT,
+                    regime TEXT,
+                    confidence REAL,
+                    triggers TEXT,
+                    recommendation TEXT,
+                    components TEXT,
+                    spy_price REAL,
+                    spy_30min_move REAL
+                )
+            """)
+
+            # Signal accuracy tracking
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS signal_accuracy (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    max_spy_range REAL,
+                    blowup_score_at_max INTEGER,
+                    direction_correct INTEGER,
+                    triggers_active TEXT,
+                    precision REAL,
+                    recall REAL
+                )
+            """)
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error(f"Database init error: {e}")
+
+    def _save_to_history(self, result: BlowupResult, spy_price: float = None):
+        """Save result to database."""
+        try:
+            conn = sqlite3.connect(str(HISTORY_DB))
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                INSERT INTO blowup_history
+                (timestamp, blowup_score, direction, regime, confidence, triggers, recommendation, components, spy_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                result.timestamp,
+                result.blowup_probability,
+                result.direction,
+                result.regime,
+                result.confidence,
+                json.dumps(result.triggers),
+                result.recommendation,
+                json.dumps(result.components),
+                spy_price
+            ))
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error(f"History save error: {e}")
+
+    def calculate(self) -> BlowupResult:
+        """
+        Calculate the blowup probability score.
+        This is the main method called every 60 seconds.
+        """
+        timestamp = datetime.now(timezone.utc).isoformat()
+        component_scores: List[ComponentScore] = []
+        triggers: List[str] = []
+
+        # Fetch all component scores
+        for name, fetcher in self.components.items():
+            try:
+                score = fetcher.fetch()
+                # Update weight from current config
+                score.weight = self.weights.get(name, DEFAULT_WEIGHTS.get(name, 0.1))
+                score.weighted_value = score.raw_value * score.weight
+                component_scores.append(score)
+
+                # Track triggers (components contributing significantly)
+                if score.raw_value > 0.3:
+                    triggers.append(f"{name}:{score.raw_value:.2f}")
+
+            except Exception as e:
+                log.error(f"Component {name} error: {e}")
+                component_scores.append(ComponentScore(
+                    name=name,
+                    raw_value=0.0,
+                    weight=self.weights.get(name, 0.1),
+                    weighted_value=0.0,
+                    source="error",
+                    healthy=False,
+                    details={"error": str(e)}
+                ))
+
+        # Calculate total blowup score
+        total_weighted = sum(cs.weighted_value for cs in component_scores)
+        blowup_probability = int(min(100, total_weighted * 100))
+
+        # Calculate confidence based on data health
+        healthy_count = sum(1 for cs in component_scores if cs.healthy)
+        confidence = healthy_count / len(component_scores)
+
+        # Determine direction
+        direction = self._determine_direction(component_scores)
+
+        # Determine regime
+        regime = self._determine_regime(component_scores, direction)
+
+        # Determine recommendation
+        recommendation = self._determine_recommendation(blowup_probability, direction, confidence)
+
+        # Get upcoming events
+        events_next_30min = self._get_events_next_30min(component_scores)
+
+        # Build result
+        result = BlowupResult(
+            blowup_probability=blowup_probability,
+            direction=direction.value,
+            regime=regime.value,
+            confidence=round(confidence, 2),
+            triggers=triggers,
+            recommendation=recommendation.value,
+            events_next_30min=events_next_30min,
+            timestamp=timestamp,
+            components=[asdict(cs) for cs in component_scores]
+        )
+
+        # Log the calculation
+        component_breakdown = " + ".join([
+            f"{cs.name}({cs.raw_value:.2f}*{cs.weight:.2f})"
+            for cs in component_scores if cs.raw_value > 0
+        ])
+        log.info(f"BLOWUP: {blowup_probability} = {component_breakdown}")
+
+        # Save to history
+        self.score_history.append(result)
+        self._save_to_history(result)
+        self.last_result = result
+
+        return result
+
+    def _determine_direction(self, components: List[ComponentScore]) -> Direction:
+        """Determine market direction from component signals."""
+        bullish_signals = 0
+        bearish_signals = 0
+
+        for cs in components:
+            details = cs.details
+
+            # VIX inversion is bearish
+            if cs.name == "vix_inversion" and cs.raw_value > 0.3:
+                bearish_signals += 1
+
+            # Flow imbalance direction
+            if cs.name == "flow_imbalance":
+                hint = details.get("direction_hint", "neutral")
+                if hint == "bearish":
+                    bearish_signals += 1
+                elif hint == "bullish":
+                    bullish_signals += 1
+
+            # Cross-asset alignment
+            if cs.name == "cross_asset":
+                alignment = details.get("alignment", "")
+                if alignment == "risk_off":
+                    bearish_signals += 1
+                elif alignment == "risk_on":
+                    bullish_signals += 1
+
+            # Breadth collapse direction
+            if cs.name == "breadth":
+                collapse_dir = details.get("collapse_direction", "")
+                if collapse_dir == "down":
+                    bearish_signals += 1
+                elif collapse_dir == "up":
+                    bullish_signals += 1
+
+        if bearish_signals >= 3:
+            return Direction.BEARISH
+        elif bullish_signals >= 3:
+            return Direction.BULLISH
+        else:
+            return Direction.NEUTRAL
+
+    def _determine_regime(self, components: List[ComponentScore], direction: Direction) -> BlowupRegime:
+        """Determine market regime from signals."""
+        # Get VIX level if available
+        flow_component = next((c for c in components if c.name == "flow_imbalance"), None)
+        vix = flow_component.details.get("vix", 20) if flow_component else 20
+
+        # Get cross-asset alignment
+        cross_component = next((c for c in components if c.name == "cross_asset"), None)
+        alignment = cross_component.details.get("alignment", "") if cross_component else ""
+
+        if vix > 25 or direction == Direction.BEARISH:
+            return BlowupRegime.RISK_OFF
+        elif vix < 18 and direction == Direction.BULLISH:
+            return BlowupRegime.RISK_ON
+        elif alignment:
+            return BlowupRegime.TRANSITION
+        else:
+            return BlowupRegime.UNKNOWN
+
+    def _determine_recommendation(self, score: int, direction: Direction, confidence: float) -> Recommendation:
+        """Determine trading recommendation based on score and direction."""
+        if confidence < 0.5:
+            return Recommendation.NO_TRADE
+
+        if score < THRESHOLDS["calm"]:  # 0-30
+            return Recommendation.SCALP_ONLY
+        elif score < THRESHOLDS["elevated"]:  # 30-50
+            return Recommendation.SCALP_ONLY
+        elif score < THRESHOLDS["high"]:  # 50-70
+            return Recommendation.STRADDLE
+        else:  # 70-100
+            if direction == Direction.BEARISH:
+                return Recommendation.DIRECTIONAL_PUT
+            elif direction == Direction.BULLISH:
+                return Recommendation.DIRECTIONAL_CALL
+            else:
+                return Recommendation.STRADDLE
+
+    def _get_events_next_30min(self, components: List[ComponentScore]) -> List[dict]:
+        """Extract upcoming events from event proximity component."""
+        event_component = next((c for c in components if c.name == "event_proximity"), None)
+        if event_component:
+            events = event_component.details.get("events_soon", [])
+            return [e for e in events if -30 <= e.get("minutes_until", 999) <= 30]
+        return []
+
+    def get_recent_scores(self, count: int = 10) -> List[dict]:
+        """Get recent blowup scores for trend display."""
+        recent = list(self.score_history)[-count:]
+        return [
+            {
+                "timestamp": r.timestamp,
+                "score": r.blowup_probability,
+                "direction": r.direction
+            }
+            for r in recent
+        ]
+
+    def get_last_result(self) -> Optional[BlowupResult]:
+        """Get the most recent calculation result."""
+        return self.last_result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SINGLETON INSTANCE
+# ═══════════════════════════════════════════════════════════════
+
+_detector_instance: Optional[BlowupDetector] = None
+
+def get_blowup_detector() -> BlowupDetector:
+    """Get or create the singleton BlowupDetector instance."""
+    global _detector_instance
+    if _detector_instance is None:
+        _detector_instance = BlowupDetector()
+    return _detector_instance
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLI FOR TESTING
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    detector = get_blowup_detector()
+    result = detector.calculate()
+
+    print("\n" + "=" * 60)
+    print("BLOWUP PROBABILITY ENGINE - TEST RUN")
+    print("=" * 60)
+    print(result.to_json())

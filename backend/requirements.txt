@@ -9,3 +9,4 @@ alpaca-py==0.33.1
 numpy==2.1.0
 schedule==1.2.2
 python-telegram-bot==21.6
+pytz==2025.2
