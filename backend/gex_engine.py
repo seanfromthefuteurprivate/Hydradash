@@ -572,9 +572,10 @@ class GEXEngine:
         )
 
         # Log summary
+        flip_str = f"${flip_point:.2f}" if flip_point else "N/A"
         log.info(
             f"GEX: {total_gex/1e9:.2f}B | Regime: {regime.value} | "
-            f"Flip: {flip_point:.2f} ({flip_distance_pct*100:.1f}% away) | "
+            f"Flip: {flip_str} ({flip_distance_pct*100:.1f}% away) | "
             f"Options: {len(options)}"
         )
 
