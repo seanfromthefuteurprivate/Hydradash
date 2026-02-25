@@ -35,6 +35,13 @@ from blowup_detector import get_blowup_detector, BlowupResult
 from event_surprise import get_event_calendar, get_surprise_detector
 from weight_calibrator import get_weight_calibrator, TradeResult
 
+# Predator Intelligence Stack (Layers 8-11)
+from predator_intelligence import get_predator_intelligence_engine
+from gex_engine import get_gex_engine
+from flow_decoder import get_flow_decoder
+from dark_pool_mapper import get_dark_pool_mapper
+from sequence_matcher import get_sequence_matcher
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("HYDRA.API")
 
@@ -51,6 +58,9 @@ ws_clients: list[WebSocket] = []
 blowup_detector = get_blowup_detector()
 event_calendar = get_event_calendar()
 weight_calibrator = get_weight_calibrator()
+
+# Predator Intelligence Engine (GEX, Flow, Dark Pool, Sequence)
+predator_engine = get_predator_intelligence_engine()
 
 
 async def broadcast_to_clients(data: str):
@@ -169,6 +179,10 @@ async def lifespan(app: FastAPI):
     for t in threads:
         t.start()
         log.info(f"Started: {t.name}")
+
+    # Start Predator Intelligence background loops (GEX, Flow, Dark Pool)
+    predator_engine.start_background_loops(loop)
+    log.info("Started: predator-intelligence-stack")
 
     yield
 
@@ -467,6 +481,169 @@ def run_calibration():
         "status": "skipped",
         "reason": "Not enough trades for calibration"
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PREDATOR INTELLIGENCE ENDPOINTS (Layers 8-11)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/predator")
+def get_predator_intelligence():
+    """
+    MASTER PREDATOR ENDPOINT: Full intelligence package from all layers.
+
+    Returns GEX, Flow, Dark Pool, and Sequence data in one call.
+    This is what WSB Snake polls for trade decisions.
+    """
+    try:
+        intel = predator_engine.get_intelligence()
+        return intel.to_dict()
+    except Exception as e:
+        log.error(f"Predator intelligence error: {e}")
+        return {
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+
+@app.get("/api/gex")
+def get_gex():
+    """
+    Layer 8: GEX (Gamma Exposure) regime and key levels.
+
+    Returns dealer gamma positioning, flip point, charm flow.
+    """
+    try:
+        gex_engine = predator_engine.gex_engine
+        snapshot = gex_engine.get_last_snapshot()
+
+        if not snapshot:
+            # Calculate fresh if no cached data
+            snapshot = gex_engine.calculate()
+
+        return snapshot.to_dict()
+    except Exception as e:
+        log.error(f"GEX endpoint error: {e}")
+        return {
+            "error": str(e),
+            "regime": "UNKNOWN",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+
+@app.get("/api/flow")
+def get_flow():
+    """
+    Layer 9: Institutional Flow classification.
+
+    Returns call/put premium, sweep activity, institutional bias.
+    Uses Claude Haiku for context-aware classification.
+    """
+    try:
+        flow_decoder = predator_engine.flow_decoder
+        snapshot = flow_decoder.get_last_snapshot()
+
+        if not snapshot:
+            snapshot = flow_decoder.calculate("SPY")
+
+        return snapshot.to_dict()
+    except Exception as e:
+        log.error(f"Flow endpoint error: {e}")
+        return {
+            "error": str(e),
+            "institutional_bias": "UNKNOWN",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+
+@app.get("/api/darkpool")
+def get_dark_pool():
+    """
+    Layer 10: Dark Pool support/resistance levels.
+
+    Returns institutional block trade levels and volume.
+    """
+    try:
+        dp_mapper = predator_engine.dp_mapper
+        snapshot = dp_mapper.get_last_snapshot()
+
+        if not snapshot:
+            snapshot = dp_mapper.calculate("SPY")
+
+        return snapshot.to_dict()
+    except Exception as e:
+        log.error(f"Dark pool endpoint error: {e}")
+        return {
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+
+@app.post("/api/sequence/analyze")
+def analyze_sequence(data: dict):
+    """
+    Layer 11: Temporal sequence analysis (on-demand).
+
+    Finds similar historical market conditions and predicts outcome.
+    Uses Nova Pro for pattern analysis (expensive - only call when needed).
+
+    Expected payload:
+    {
+        "trade_direction": "BULLISH" | "BEARISH"
+    }
+    """
+    try:
+        trade_direction = data.get("trade_direction", "BULLISH")
+        analysis = predator_engine.run_sequence_analysis(trade_direction)
+        return analysis.to_dict()
+    except Exception as e:
+        log.error(f"Sequence analysis error: {e}")
+        return {
+            "error": str(e),
+            "predicted_direction": "NEUTRAL",
+            "confidence": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+
+@app.post("/api/conviction")
+def get_conviction_modifiers(data: dict):
+    """
+    Get conviction modifiers from all predator layers for a proposed trade.
+
+    WSB Snake calls this before entering a position to get a total
+    conviction boost/penalty from all intelligence layers.
+
+    Expected payload:
+    {
+        "trade_direction": "BULLISH" | "BEARISH",
+        "entry_price": 548.00,
+        "stop_price": 546.50,
+        "target_price": 551.00
+    }
+    """
+    try:
+        trade_direction = data.get("trade_direction", "BULLISH")
+        entry_price = data.get("entry_price", 0)
+        stop_price = data.get("stop_price", 0)
+        target_price = data.get("target_price", 0)
+
+        modifiers = predator_engine.get_trade_conviction_modifiers(
+            trade_direction=trade_direction,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price
+        )
+
+        return modifiers
+    except Exception as e:
+        log.error(f"Conviction modifiers error: {e}")
+        return {
+            "error": str(e),
+            "total_modifier": 0,
+            "modifiers": {},
+            "reasons": []
+        }
 
 
 # ── WebSocket for real-time updates ──
