@@ -214,59 +214,70 @@ class ComponentFetcher:
 
 class VIXTermStructure(ComponentFetcher):
     """
-    VIX Term Structure Inversion Detection.
-    If 0DTE IV > 1DTE IV by >20%, score +25 (normalized to 0.25/0.20 = 1.25 cap at 1.0)
-    Uses Polygon for options data or falls back to CBOE VIX data.
+    VIX Volatility Indicator.
+    Uses VIX level and daily change as volatility signal.
+    High VIX (>25) = elevated fear, increasing VIX = worsening sentiment.
     """
 
     def fetch(self) -> ComponentScore:
         score = 0.0
         details = {}
-        source = "polygon"
+        source = "polygon_prev"
         healthy = True
 
-        # Try Polygon API for SPY options term structure
         api_key = os.environ.get("POLYGON_API_KEY", "")
         if api_key:
             try:
-                # Get SPY 0DTE and 1DTE ATM options implied vol
-                today = datetime.now().strftime("%Y-%m-%d")
-                tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-                # Simplified: use VIX index as proxy (free tier limitation)
+                # Get VIX data
                 vix_data = self._get(
-                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+                    "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
                     params={"apiKey": api_key}
                 )
 
-                vix9d_data = self._get(
-                    f"https://api.polygon.io/v2/aggs/ticker/I:VIX9D/prev",
-                    params={"apiKey": api_key}
-                )
+                if vix_data and vix_data.get("results"):
+                    result = vix_data["results"][0]
+                    vix_open = result.get("o", 20)
+                    vix_close = result.get("c", 20)
+                    vix_high = result.get("h", 20)
 
-                if vix_data and vix9d_data:
-                    vix = vix_data.get("results", [{}])[0].get("c", 20)
-                    vix9d = vix9d_data.get("results", [{}])[0].get("c", 20)
+                    # Calculate daily change
+                    vix_change = ((vix_close - vix_open) / vix_open) if vix_open > 0 else 0
 
-                    # Inversion: short-term vol > long-term vol
-                    if vix9d > 0:
-                        inversion_pct = (vix - vix9d) / vix9d
-                        details = {"vix": vix, "vix9d": vix9d, "inversion_pct": inversion_pct}
+                    details = {
+                        "vix_close": round(vix_close, 2),
+                        "vix_open": round(vix_open, 2),
+                        "vix_high": round(vix_high, 2),
+                        "vix_change_pct": round(vix_change * 100, 2)
+                    }
 
-                        # Score based on inversion degree
-                        if inversion_pct > 0.20:  # >20% inverted
-                            score = min(1.0, inversion_pct / 0.40)  # Cap at 40% = score 1.0
-                        elif inversion_pct > 0.10:
-                            score = inversion_pct / 0.40
-                        elif inversion_pct > 0:
-                            score = inversion_pct / 0.80  # Mild inversion
+                    # Score based on VIX level and change
+                    # High VIX = elevated volatility/fear
+                    if vix_close > 35:
+                        score = 1.0  # Extreme fear
+                    elif vix_close > 30:
+                        score = 0.8
+                    elif vix_close > 25:
+                        score = 0.5
+                    elif vix_close > 22:
+                        score = 0.3
+                    elif vix_close > 20:
+                        score = 0.15
+
+                    # Boost score if VIX is rising
+                    if vix_change > 0.10:  # >10% increase
+                        score = min(1.0, score + 0.3)
+                    elif vix_change > 0.05:  # >5% increase
+                        score = min(1.0, score + 0.15)
+
+                    details["score_reason"] = f"VIX {vix_close:.1f}, change {vix_change*100:+.1f}%"
                 else:
                     healthy = False
+                    details["error"] = "No VIX data"
 
             except Exception as e:
-                log.debug(f"VIX term structure error: {e}")
+                log.debug(f"VIX error: {e}")
                 healthy = False
-                source = "fallback"
+                details["error"] = str(e)
         else:
             healthy = False
             source = "no_api_key"
@@ -798,8 +809,8 @@ class BreadthCollapse(ComponentFetcher):
     If most sectors moved same direction strongly = breadth collapse signal.
     """
 
-    # Major sector ETFs to check for breadth
-    SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE"]
+    # Top 5 sector ETFs by AUM (reduced from 10 to stay within API rate limits)
+    SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLE"]
 
     def fetch(self) -> ComponentScore:
         score = 0.0
@@ -836,7 +847,7 @@ class BreadthCollapse(ComponentFetcher):
                                 down_count += 1
 
                 total = up_count + down_count
-                if total >= 5:  # Need at least 5 sectors reporting
+                if total >= 3:  # Need at least 3 sectors showing significant moves
                     max_side = max(up_count, down_count)
                     breadth_ratio = max_side / len(self.SECTOR_ETFS)
 
